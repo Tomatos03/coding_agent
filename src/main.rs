@@ -1,9 +1,5 @@
+use coding_agent::{constant::NVIDIA_NEMOTRON_3_ULTRA_550B_A55B, llm::structured::{chat_complete_structured}};
 use tracing_subscriber::FmtSubscriber;
-
-use crate::{constant::NVIDIA_NEMOTRON_3_ULTRA_550B_A55B, llm::complete::chat_complete};
-
-mod llm;
-mod constant;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -15,9 +11,13 @@ async fn main() -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
     tracing::info!("tracing initialized");
 
-    let content = chat_complete(NVIDIA_NEMOTRON_3_ULTRA_550B_A55B, Some("You are a helpful assistant."), "Hello, how are you?").await?;
+    let content = chat_complete_structured(
+        NVIDIA_NEMOTRON_3_ULTRA_550B_A55B,
+        Some("你是一个全能助手"),
+        "我需要去北京看故宫，怎么安排行程？",
+    )
+    .await?;
 
-    println!("Response: {content}");
-
+    println!("Response: {content:#?}");
     Ok(())
 }
