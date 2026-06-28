@@ -6,6 +6,7 @@ use async_openai::{
     },
 };
 use async_stream::stream;
+use backon::{ExponentialBuilder, Retryable};
 use futures::{Stream, StreamExt};
 
 pub async fn chat_stream(
@@ -59,4 +60,31 @@ pub async fn chat_stream(
             }
         }
     }
+}
+
+
+pub async fn chat_stream_with_retry(
+    model: &str,
+    system: Option<&str>,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let op = || async {
+        let stream = chat_stream(model, system, prompt).await;
+        futures::pin_mut!(stream);
+        let mut content = String::new();
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(text) => {
+                    content.push_str(&text);
+                    print!("{text}");
+                }
+                Err(e) => {
+                    tracing::error!("Error: {e}");
+                    return Err(e)
+                }
+            }
+        }
+        Ok(content)
+    };
+    op.retry(ExponentialBuilder::default().with_max_times(3)).await
 }
