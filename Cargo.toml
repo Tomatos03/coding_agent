@@ -5,8 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-async-openai = "0.41.0"
+async-openai = { version = "0.41.0", features = ["chat-completion"] }
 dotenv = "0.15.0"
+schemars = "1.2.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 tokio = { version = "1.52.3", features = ["full"] }
