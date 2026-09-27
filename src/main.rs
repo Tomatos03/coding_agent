@@ -1,23 +1,18 @@
-use coding_agent::{constant::NVIDIA_NEMOTRON_3_ULTRA_550B_A55B, llm::structured::{chat_complete_structured}};
-use tracing_subscriber::FmtSubscriber;
+use coding_agent::agent::llm::models::{Completer, LLMClient};
+use coding_agent::agent::react::history::History;
+use coding_agent::bootstrap::init;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenv::dotenv()?;
+    init();
 
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(tracing::Level::INFO)
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
-    tracing::info!("tracing initialized");
+    let mut history = History::new();
+    history.system("你是一个编码领域的专家。")?;
+    history.user("请你计算 5 * 10 / 5 的结果，只回一个数字。")?;
 
-    let content = chat_complete_structured(
-        NVIDIA_NEMOTRON_3_ULTRA_550B_A55B,
-        Some("你是一个全能助手"),
-        "我需要去北京看故宫，怎么安排行程？",
-    )
-    .await?;
+    let client = LLMClient::new();
+    let reply = client.complete(history.as_slice(), None).await?;
 
-    println!("Response: {content:#?}");
+    println!("Response: {}", reply.content);
     Ok(())
 }
