@@ -1,10 +1,12 @@
 use super::provider;
 use crate::constant::provider::MAX_TOKENS_ENV;
 
+use crate::tools::{ToolHashMap, tool_definitions};
+
 use async_openai::config::OpenAIConfig;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls, ChatCompletionRequestMessage, ChatCompletionTools,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
     CreateChatCompletionRequestArgs, FinishReason, FunctionCall,
 };
 use futures::StreamExt;
@@ -20,13 +22,13 @@ pub trait Completer: Send + Sync {
     async fn complete(
         &self,
         messages: &[ChatCompletionRequestMessage],
-        tools: Option<&[ChatCompletionTools]>,
+        tools: Option<&ToolHashMap>,
     ) -> anyhow::Result<Reply>;
 
     async fn stream(
         &self,
         messages: &[ChatCompletionRequestMessage],
-        tools: Option<&[ChatCompletionTools]>,
+        tools: Option<&ToolHashMap>,
         on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> anyhow::Result<Reply>;
 }
@@ -54,7 +56,7 @@ impl LLMClient {
     fn request(
         &self,
         messages: &[ChatCompletionRequestMessage],
-        tools: Option<&[ChatCompletionTools]>,
+        tools: Option<&ToolHashMap>,
     ) -> anyhow::Result<async_openai::types::chat::CreateChatCompletionRequest> {
         let mut builder = CreateChatCompletionRequestArgs::default();
         builder
@@ -62,7 +64,7 @@ impl LLMClient {
             .messages(messages.to_vec())
             .max_tokens(self.max_tokens);
         if let Some(tools) = tools {
-            builder.tools(tools.to_vec());
+            builder.tools(tool_definitions(tools)?);
         }
         Ok(builder.build()?)
     }
@@ -73,7 +75,7 @@ impl Completer for LLMClient {
     async fn complete(
         &self,
         messages: &[ChatCompletionRequestMessage],
-        tools: Option<&[ChatCompletionTools]>,
+        tools: Option<&ToolHashMap>,
     ) -> anyhow::Result<Reply> {
         let request = self.request(messages, tools)?;
         let response = self.internal_client.chat().create(request).await?;
@@ -95,7 +97,7 @@ impl Completer for LLMClient {
     async fn stream(
         &self,
         messages: &[ChatCompletionRequestMessage],
-        tools: Option<&[ChatCompletionTools]>,
+        tools: Option<&ToolHashMap>,
         on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> anyhow::Result<Reply> {
         let request = self.request(messages, tools)?;

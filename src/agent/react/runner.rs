@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_openai::types::chat::{
-    ChatCompletionMessageToolCalls, ChatCompletionRequestMessage, ChatCompletionTools,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
 };
 
 use crate::agent::llm::models::{Completer, Reply};
@@ -12,7 +12,6 @@ use crate::tools::ToolHashMap;
 pub struct ReactLoop {
     completer: Arc<dyn Completer>,
     tools: ToolHashMap,
-    tool_defs: Vec<ChatCompletionTools>,
     history: History,
     max_turns: usize,
 }
@@ -24,18 +23,12 @@ impl ReactLoop {
         system_prompt: &str,
         max_turns: usize,
     ) -> anyhow::Result<Self> {
-        let tool_defs: Vec<ChatCompletionTools> = tools
-            .values()
-            .map(|tool| tool.definition())
-            .collect::<anyhow::Result<_>>()?;
-
         let mut history = History::new();
         history.system(system_prompt)?;
 
         Ok(Self {
             completer,
             tools,
-            tool_defs,
             history,
             max_turns,
         })
@@ -58,7 +51,7 @@ impl ReactLoop {
                 .completer
                 .stream(
                     self.history.as_slice(),
-                    Some(&self.tool_defs),
+                    Some(&self.tools),
                     &mut |token| on_token(turn, token),
                 )
                 .await?;
@@ -262,7 +255,7 @@ mod tests {
         async fn complete(
             &self,
             _messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&[ChatCompletionTools]>,
+            _tools: Option<&ToolHashMap>,
         ) -> anyhow::Result<Reply> {
             self.next(&mut |_| {})
         }
@@ -270,7 +263,7 @@ mod tests {
         async fn stream(
             &self,
             _messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&[ChatCompletionTools]>,
+            _tools: Option<&ToolHashMap>,
             on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
         ) -> anyhow::Result<Reply> {
             self.next(on_token)

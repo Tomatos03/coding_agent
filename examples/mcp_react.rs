@@ -13,14 +13,14 @@ use std::sync::{Arc, Mutex};
 
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
-    ChatCompletionTools, FunctionCall,
+    FunctionCall,
 };
 use coding_agent::agent::llm::models::{Completer, Reply};
 use coding_agent::agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::agent::react::runner::ReactLoop;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
-use coding_agent::tools::build_tools_with;
+use coding_agent::tools::{ToolHashMap, build_tools_with};
 use coding_agent::tools::mcp::{McpConfig, McpServerConfig};
 
 /// 按预置队列依次返回回复的 `Completer`，用来替代真实 LLM。
@@ -49,7 +49,7 @@ impl Completer for ScriptedCompleter {
     async fn complete(
         &self,
         _messages: &[ChatCompletionRequestMessage],
-        _tools: Option<&[ChatCompletionTools]>,
+        _tools: Option<&ToolHashMap>,
     ) -> anyhow::Result<Reply> {
         self.next()
     }
@@ -57,7 +57,7 @@ impl Completer for ScriptedCompleter {
     async fn stream(
         &self,
         _messages: &[ChatCompletionRequestMessage],
-        _tools: Option<&[ChatCompletionTools]>,
+        _tools: Option<&ToolHashMap>,
         on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> anyhow::Result<Reply> {
         let reply = self.next()?;

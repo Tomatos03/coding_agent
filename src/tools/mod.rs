@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use async_openai::types::chat::ChatCompletionTools;
+
 use crate::tools::{
     local::WebSearch,
     mcp::{McpConfig, connect_all, load_config, tools_from_connection},
@@ -11,6 +13,13 @@ pub mod mcp;
 pub mod tool;
 
 pub type ToolHashMap = HashMap<String, Box<dyn Tool>>;
+
+/// 把工具表转换成 OpenAI function-calling 需要的工具定义。
+///
+/// `tool_defs` 是派生数据，由 `tools` 唯一决定，因此调用方只需持有工具表。
+pub fn tool_definitions(tools: &ToolHashMap) -> anyhow::Result<Vec<ChatCompletionTools>> {
+    tools.values().map(|tool| tool.definition()).collect()
+}
 
 /// 启动时构建工具表：本地工具 + `mcp.json` 中配置的 MCP 工具。
 ///
