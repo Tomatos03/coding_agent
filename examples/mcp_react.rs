@@ -20,8 +20,8 @@ use coding_agent::agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::agent::react::runner::ReactLoop;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
-use coding_agent::tools::{ToolHashMap, build_tools_with};
 use coding_agent::tools::mcp::{McpConfig, McpServerConfig};
+use coding_agent::tools::{ToolHashMap, build_tools_with};
 
 /// 按预置队列依次返回回复的 `Completer`，用来替代真实 LLM。
 struct ScriptedCompleter {

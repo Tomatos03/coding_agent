@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_openai::types::chat::ChatCompletionTools;
 
@@ -12,7 +13,10 @@ pub mod local;
 pub mod mcp;
 pub mod tool;
 
-pub type ToolHashMap = HashMap<String, Box<dyn Tool>>;
+/// 工具注册表。值是 `Arc<dyn Tool>`（而非 `Box`），因此整张表是 `Clone` 的：
+/// MCP 工具内部持有子进程连接，评测这类要把同一张表分发给多个任务的场景
+/// 必须能廉价克隆，而不能每个任务重建（重建会重复拉起 MCP 子进程）。
+pub type ToolHashMap = HashMap<String, Arc<dyn Tool>>;
 
 /// 把工具表转换成 OpenAI function-calling 需要的工具定义。
 ///
@@ -70,7 +74,7 @@ fn insert_tools(registry: &mut ToolHashMap, tools: Vec<Box<dyn Tool>>) -> usize 
             tracing::warn!(target: "mcp", "工具名 `{name}` 冲突，跳过重复注册");
             continue;
         }
-        registry.insert(name, tool);
+        registry.insert(name, Arc::from(tool));
         inserted += 1;
     }
     inserted

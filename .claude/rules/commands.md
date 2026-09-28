@@ -3,7 +3,7 @@
 ```bash
 cargo build
 cargo run                          # bin: coding_agent —— History + LLMClient::complete 的单轮 demo（main.rs）
-cargo run --bin gaia               # GAIA Level 1 批量评测，需要 HF_TOKEN
+cargo run --bin gaia               # GAIA Level 1 对比评测：每题各跑一次「带工具 / 不带工具」，输出两组通过数/通过率；需要 HF_TOKEN
 cargo run --example react_chat     # ReAct 主循环，逐轮打印 Thought / Answer / Action / Observation（非流式）
 cargo run --example stream_chat    # 流式输出
 cargo run --example semaphore_chat # 并发限流：5 个任务抢 3 个 permit
@@ -20,7 +20,7 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 
 ## 测试
 
-**当前 43 个测试**：默认跑 40 个（全部离线，不联网、不需要凭证），另外 3 个是 `#[ignore]` 的 MCP 集成测试（需要本机 `python3`）。
+**当前 54 个测试**：默认跑 51 个（全部离线，不联网、不需要凭证），另外 3 个是 `#[ignore]` 的 MCP 集成测试（需要本机 `python3`）。
 
 `src/agent/react/runner.rs` 8 个，覆盖循环逻辑：
 
@@ -35,6 +35,8 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 
 后两条用 `trace()` 辅助函数把 `Step` 压成 `(轮次, 类型)` 序列做整体比对——比逐个 `assert!(matches!(...))` 更能钉住**顺序**，而这两条的核心正是发射顺序。
 
+`src/agent/react/context.rs` 2 个：`ExecuteContext` 每次构造拿到唯一 id 且初始 `Running`、`set_status` 的状态流转。
+
 `src/agent/llm/models.rs` 3 个，覆盖流式分片重组（`ToolCallAccumulator`）：
 
 - 单个调用的 `arguments` 被切成 4 片 → 拼回完整字符串
@@ -47,6 +49,8 @@ MCP 相关共 32 个：
 - `src/tools/mcp/tool.rs` 14 个（1 个 ignored）：结果映射、参数解析、命名校验、适配器端到端调用
 - `src/tools/mcp/connection.rs` 5 个（1 个 ignored）：`Send + Sync`、空配置、失败隔离、真实 server 工具发现
 - `src/tools/mod.rs` 3 个（1 个 ignored）：重名去重、空配置只含本地工具、连接在注册后仍存活
+
+GAIA 相关 9 个（全部离线）：`src/gaia/solver.rs` 6 个（严格 JSON / 代码块与正文包裹 / 字符串内花括号 / 纯文本兜底 / 空内容报错 / 无平衡对象），`src/gaia/report.rs` 2 个（按模型×模式汇总、通过率边界），`src/gaia/evaluator.rs` 1 个（脚本化 `Completer` 跑通带工具的 ReAct 路径并统计工具调用次数）。
 
 3 个 `#[ignore]` 都需要 `python3` + `tests/fixtures/fake_mcp_server.py`，跑法：
 

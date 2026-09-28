@@ -108,6 +108,10 @@ cargo run --example mcp_chat -- "用 MCP 的 echo 工具确认链路"
 
 # 查看当前注册的工具表
 cargo run --example tool_exec -- "rust async"
+
+# GAIA Level 1 对比评测：每题各跑一次「带工具 / 不带工具」，输出两组通过数/通过率
+# 需要 HF_TOKEN；带工具组使用本地工具 + mcp.json 中的 MCP 工具
+cargo run --bin gaia
 ```
 
 ## 已知限制

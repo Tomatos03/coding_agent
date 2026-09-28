@@ -44,12 +44,12 @@ src/tools/         工具层：spec / execute
 | `src/tools/mcp/config.rs` | 读取并校验 `mcp.json`（`McpConfig` / `McpServerConfig`） |
 | `src/tools/mcp/connection.rs` | `McpConnection`、`connect` / `connect_all`：启动子进程、握手、`tools/list`、失败隔离与子进程 keep-alive |
 | `src/tools/mcp/tool.rs` | `McpTool`：远端工具 -> 本地 `Tool` 适配（命名、调用、`CallToolResult` 映射） |
-| `src/tools/mod.rs` | `ToolHashMap`（`HashMap<String, Box<dyn Tool>>`）与 `build_tools()`（异步、合并本地 + MCP）/ `build_tools_with(config)`（不读文件的测试接缝） |
-| `src/gaia/` | 独立的评测垂直切片：HF 拉数据集 → 逐题求解 → 比对答案。与 `agent/` 平行，只借用 `llm::provider` 的客户端配置 |
+| `src/tools/mod.rs` | `ToolHashMap`（`HashMap<String, Arc<dyn Tool>>`，值用 `Arc` 所以整张表可廉价克隆）与 `build_tools()`（异步、合并本地 + MCP）/ `build_tools_with(config)`（不读文件的测试接缝） |
+| `src/gaia/` | 独立的评测垂直切片：HF 拉数据集 → 每题分别按「直答」与「ReAct + 工具」两种模式求解 → 比对答案（`report.rs` 按模型×模式汇总通过率）。除借用 `llm::provider` 的客户端配置外，带工具模式还向下依赖 `agent::react`（`ReactLoop`）与 `tools` |
 | `src/constant/` | 按领域分的字面量常量：`provider.rs`（provider 名与凭证环境变量名）、`prompt.rs`（`SYSTEM_PROMPT`）、`gaia.rs`（评测参数）。模型 ID 本身走 `CURRENT_USE_MODEL_ID`，不硬编码 |
 | `src/bootstrap.rs` | dotenv + tracing 的统一初始化入口 |
 
-可执行入口：`src/main.rs`（`History` + `LLMClient::complete` 的单轮 demo）、`src/bin/gaia.rs`（GAIA 批量评测）。`examples/` 下八个：
+可执行入口：`src/main.rs`（`History` + `LLMClient::complete` 的单轮 demo）、`src/bin/gaia.rs`（GAIA 对比评测：每题各跑一次「带工具 / 不带工具」，输出两组通过数与通过率）。`examples/` 下八个：
 
 | 示例 | 演示什么 |
 |---|---|

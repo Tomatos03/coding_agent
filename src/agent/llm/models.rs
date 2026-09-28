@@ -6,8 +6,8 @@ use crate::tools::{ToolHashMap, tool_definitions};
 use async_openai::config::OpenAIConfig;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCallChunk,
-    ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
-    CreateChatCompletionRequestArgs, FinishReason, FunctionCall,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestMessage, CreateChatCompletionRequestArgs,
+    FinishReason, FunctionCall,
 };
 use futures::StreamExt;
 
@@ -42,15 +42,19 @@ pub struct LLMClient {
 impl LLMClient {
     pub fn new() -> Self {
         let model = provider::model_id().expect("缺少 CURRENT_USE_MODEL_ID，请检查 .env");
-        let internal_client = async_openai::Client::with_config(
-            provider::client_config().expect("缺少 provider 配置，请检查 .env"),
-        );
+        Self::from_model(&model).expect("缺少 provider 配置，请检查 .env")
+    }
 
-        Self {
-            model,
+    /// 用显式模型 ID 构造：调用方已经读过 `model_id()` 时不必再读一次环境变量，
+    /// 也避免 `new()` 在配置缺失时 panic。
+    pub fn from_model(model: &str) -> anyhow::Result<Self> {
+        let internal_client = async_openai::Client::with_config(provider::client_config()?);
+
+        Ok(Self {
+            model: model.to_owned(),
             max_tokens: provider::max_tokens(),
             internal_client,
-        }
+        })
     }
 
     fn request(

@@ -1,11 +1,16 @@
+use std::sync::Arc;
+
 use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
     CreateChatCompletionRequestArgs, FinishReason, ResponseFormat, ResponseFormatJsonSchema,
 };
 use backon::{ExponentialBuilder, Retryable};
 
-use crate::agent::llm::provider;
+use crate::agent::llm::{models::Completer, provider};
+use crate::agent::react::models::{DEFAULT_MAX_TURNS, Step};
+use crate::agent::react::runner::ReactLoop;
 use crate::gaia::models::GaiaOutput;
+use crate::tools::ToolHashMap;
 
 pub const GAIA_PROMPT: &str = r#"You are a general AI assistant. I will ask you a question.
 First, determine if you can solve this problem with your current capabilities and set "is_solvable" accordingly.
@@ -18,6 +23,17 @@ If you are asked for a comma-separated list, apply the above rules depending on 
 Respond with a single JSON object containing exactly these keys: "is_solvable" (boolean), "unsolvable_reason" (string, empty when is_solvable is true), "final_answer" (string).
 "#;
 
+pub const GAIA_TOOLS_PROMPT: &str = r#"You are a general AI assistant with access to tools. I will ask you a question.
+Use the provided tools whenever they can help you gather facts or compute the answer (for example web_search). Call a tool only when it is useful; otherwise work it out yourself.
+Once you have enough information, stop calling tools and reply with the final answer, and nothing else, as the JSON object described below.
+Your final answer should be a number OR as few words as possible OR a comma-separated list of numbers and/or strings.
+If you are asked for a number, don't use a comma to write your number neither use units such as $ or percent sign unless specified otherwise.
+If you are asked for a string, don't use articles, neither abbreviations (e.g., for cities), and write the digits in plain text.
+If you are asked for a comma-separated list, apply the above rules depending on whether the element is a number or a string.
+First determine if the question is solvable with your current capabilities and set "is_solvable" accordingly.
+When you are done, respond with a single JSON object containing exactly these keys: "is_solvable" (boolean), "unsolvable_reason" (string, empty when is_solvable is true), "final_answer" (string).
+"#;
+
 pub async fn solve_gaia_question_with_retry(
     model_id: &str,
     system: &str,
@@ -26,6 +42,48 @@ pub async fn solve_gaia_question_with_retry(
     let op = || async { solve_gaia_question(model_id, system, prompt).await };
     op.retry(ExponentialBuilder::default().with_max_times(3))
         .await
+}
+
+pub async fn solve_gaia_question_with_tools_retry(
+    completer: &Arc<dyn Completer>,
+    tools: &ToolHashMap,
+    system: &str,
+    prompt: &str,
+) -> anyhow::Result<(GaiaOutput, usize)> {
+    let op = || async {
+        solve_gaia_question_with_tools(completer.clone(), tools.clone(), system, prompt).await
+    };
+    op.retry(ExponentialBuilder::default().with_max_times(3))
+        .await
+}
+
+/// 用 ReAct 循环解题，返回解析后的输出与**实际发起的工具调用次数**。
+///
+/// 调用次数用于判断「带工具」这一组成绩是否真的用上了工具——模型可能全程
+/// 直接作答，此时与「不带工具」的差异只剩输出格式，不代表工具起了作用。
+pub async fn solve_gaia_question_with_tools(
+    completer: Arc<dyn Completer>,
+    tools: ToolHashMap,
+    system: &str,
+    prompt: &str,
+) -> anyhow::Result<(GaiaOutput, usize)> {
+    let mut agent = ReactLoop::new(completer, tools, system, DEFAULT_MAX_TURNS)?;
+
+    let mut tool_calls = 0usize;
+    let outcome = agent
+        .run(
+            prompt,
+            |step| {
+                if matches!(step, Step::Action { .. }) {
+                    tool_calls += 1;
+                }
+            },
+            |_, _| {},
+        )
+        .await?;
+
+    let output = parse_gaia_output(&outcome.answer)?;
+    Ok((output, tool_calls))
 }
 
 pub async fn solve_gaia_question(
@@ -58,12 +116,73 @@ pub async fn solve_gaia_question(
         anyhow::anyhow!("No content returned from the model in the choice message")
     })?;
 
-    to_gaia_output(content)
+    parse_gaia_output(&content)
 }
 
-fn to_gaia_output(content: String) -> Result<GaiaOutput, anyhow::Error> {
-    let output = serde_json::from_str::<GaiaOutput>(&content)?;
-    Ok(output)
+/// 把模型返回的文本解析成 [`GaiaOutput`]，容忍 JSON 被包在正文或 ``` 代码块里。
+///
+/// 直答模式能靠 `response_format` 约束成纯 JSON；带工具模式走 ReAct 循环，没有
+/// `response_format` 可依赖，收尾轮的 content 可能带前缀说明，所以这里逐级放宽：
+/// 整段解析 → 提取第一个平衡的 `{...}` → 兜底把整段文本当作答案。
+pub fn parse_gaia_output(content: &str) -> anyhow::Result<GaiaOutput> {
+    if let Ok(output) = serde_json::from_str::<GaiaOutput>(content) {
+        return Ok(output);
+    }
+
+    if let Some(candidate) = extract_json_object(content)
+        && let Ok(output) = serde_json::from_str::<GaiaOutput>(&candidate)
+    {
+        return Ok(output);
+    }
+
+    let fallback = content.trim();
+    if fallback.is_empty() {
+        anyhow::bail!("模型没有返回可解析的 GAIA 输出");
+    }
+
+    Ok(GaiaOutput {
+        is_solvable: true,
+        unsolvable_reason: String::new(),
+        final_answer: fallback.to_owned(),
+    })
+}
+
+/// 取文本里第一个花括号平衡的子串；字符串字面量内的花括号与转义不计入深度。
+fn extract_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let bytes = text.as_bytes();
+
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, &byte) in bytes[start..].iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match byte {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset + 1;
+                    return Some(text[start..end].to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 fn build_request(

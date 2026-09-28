@@ -33,15 +33,33 @@ pub struct GaiaOutput {
     pub final_answer: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum GaiaMode {
+    WithoutTools,
+    WithTools,
+}
+
+impl GaiaMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            GaiaMode::WithoutTools => "不调用工具",
+            GaiaMode::WithTools => "调用工具",
+        }
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Serialize, Debug)]
 pub struct GaiaEvalResult {
     pub task_id: String,
     pub model: String,
+    pub mode: GaiaMode,
     pub correct: bool,
     pub is_solvable: Option<bool>,
     pub prediction: Option<String>,
     pub answer: String,
     pub unsolvable_reason: Option<String>,
     pub error: Option<String>,
+    pub tool_calls: Option<usize>,
 }
