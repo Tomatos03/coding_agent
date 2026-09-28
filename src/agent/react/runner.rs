@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use async_openai::types::chat::{
-    ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
-};
+use async_openai::types::chat::{ChatCompletionMessageToolCalls, ChatCompletionRequestMessage};
+use tracing::info;
 
 use crate::agent::llm::models::{Completer, Reply};
+use crate::agent::react::context::{Event, EventName, ExecuteContext, Role, Status};
 use crate::agent::react::history::History;
 use crate::agent::react::models::{Outcome, Step, Termination};
 use crate::tools::ToolHashMap;
@@ -44,86 +44,146 @@ impl ReactLoop {
         mut on_step: impl FnMut(&Step),
         mut on_token: impl FnMut(usize, &str) + Send,
     ) -> anyhow::Result<Outcome> {
+        let mut context = ExecuteContext::new();
+
+        let outcome = self
+            .run_loop(prompt, &mut context, &mut on_step, &mut on_token)
+            .await;
+
+        info!("actual execute turns: {}", context.turn());
+        outcome
+    }
+
+    async fn run_loop(
+        &mut self,
+        prompt: &str,
+        context: &mut ExecuteContext,
+        on_step: &mut impl FnMut(&Step),
+        on_token: &mut (impl FnMut(usize, &str) + Send),
+    ) -> anyhow::Result<Outcome> {
         self.history.user(prompt)?;
 
         for turn in 1..=self.max_turns {
-            let reply = self
-                .completer
-                .stream(
-                    self.history.as_slice(),
-                    Some(&self.tools),
-                    &mut |token| on_token(turn, token),
-                )
-                .await?;
+            context.set_turn(turn);
 
-            let Reply {
-                content: thought,
-                tool_calls: calls,
-            } = reply;
+            let progressed = self
+                .run_turn(turn, &mut *context, &mut *on_step, &mut *on_token)
+                .await;
 
-            if thought.trim().is_empty() && calls.is_empty() {
-                on_step(&Step::Nudge {
-                    turn,
-                    reason: "模型返回了空回复".to_owned(),
-                });
-                self.history
-                    .user("你上一条回复是空的。请继续，或直接给出最终答案。")?;
-                continue;
-            }
+            observe(context);
 
-            self.history.assistant(&thought, calls.clone())?;
-
-            if calls.is_empty() {
-                if !thought.is_empty() {
-                    on_step(&Step::Answer {
-                        turn,
-                        content: thought.clone(),
-                    });
-                }
-                return Ok(Outcome {
-                    answer: thought,
-                    turns: turn,
-                    termination: Termination::ModelFinished,
-                });
-            }
-
-            if !thought.is_empty() {
-                on_step(&Step::Thought {
-                    turn,
-                    content: thought.clone(),
-                });
-            }
-
-            for call in &calls {
-                let ChatCompletionMessageToolCalls::Function(func_call) = call else {
-                    continue;
-                };
-                let name = func_call.function.name.clone();
-                let arguments = func_call.function.arguments.clone();
-
-                on_step(&Step::Action {
-                    turn,
-                    name: name.clone(),
-                    arguments: arguments.clone(),
-                });
-
-                let output = self.execute(&name, &arguments).await;
-                on_step(&Step::Observation {
-                    turn,
-                    name: name.clone(),
-                    output: output.clone(),
-                });
-
-                self.history.tool(&func_call.id, &output)?;
+            if let Some(outcome) = progressed? {
+                context.set_status(Status::Completed);
+                return Ok(outcome);
             }
         }
 
-        let answer = self.finalize(&mut on_token).await?;
+        context.set_status(Status::Completed);
+        let answer = self.finalize(context, on_token).await?;
         Ok(Outcome {
             answer,
             turns: self.max_turns,
             termination: Termination::MaxTurns,
         })
+    }
+
+    async fn run_turn(
+        &mut self,
+        turn: usize,
+        context: &mut ExecuteContext,
+        on_step: &mut impl FnMut(&Step),
+        on_token: &mut (impl FnMut(usize, &str) + Send),
+    ) -> anyhow::Result<Option<Outcome>> {
+        let reply = self
+            .completer
+            .stream(self.history.as_slice(), Some(&self.tools), &mut |token| {
+                on_token(turn, token)
+            })
+            .await?;
+
+        let Reply {
+            content: thought,
+            tool_calls: calls,
+        } = reply;
+
+        if thought.trim().is_empty() && calls.is_empty() {
+            on_step(&Step::Nudge {
+                turn,
+                reason: "模型返回了空回复".to_owned(),
+            });
+            self.history
+                .user("你上一条回复是空的。请继续，或直接给出最终答案。")?;
+            return Ok(None);
+        }
+
+        self.history.assistant(&thought, calls.clone())?;
+
+        if calls.is_empty() {
+            if !thought.is_empty() {
+                on_step(&Step::Answer {
+                    turn,
+                    content: thought.clone(),
+                });
+            }
+            context.push_event(Event::new(
+                EventName::Answer,
+                thought.clone(),
+                Role::Assistant,
+            ));
+            return Ok(Some(Outcome {
+                answer: thought,
+                turns: turn,
+                termination: Termination::ModelFinished,
+            }));
+        }
+
+        if !thought.is_empty() {
+            on_step(&Step::Thought {
+                turn,
+                content: thought.clone(),
+            });
+            context.push_event(Event::new(
+                EventName::Thought,
+                thought.clone(),
+                Role::Assistant,
+            ));
+        }
+
+        for call in &calls {
+            let ChatCompletionMessageToolCalls::Function(func_call) = call else {
+                continue;
+            };
+            let name = func_call.function.name.clone();
+            let arguments = func_call.function.arguments.clone();
+
+            on_step(&Step::Action {
+                turn,
+                name: name.clone(),
+                arguments: arguments.clone(),
+            });
+            context.push_event(Event::new(
+                EventName::ToolCall,
+                arguments.clone(),
+                Role::Assistant,
+            ));
+
+            let output = self.execute(&name, &arguments).await;
+
+            on_step(&Step::Observation {
+                turn,
+                name: name.clone(),
+                output: output.clone(),
+            });
+            context.push_event(Event::new(
+                EventName::ToolResult,
+                output.clone(),
+                Role::Tool,
+            ));
+
+            self.history.tool(&func_call.id, &output)?;
+        }
+
+        Ok(None)
     }
 
     async fn execute(&self, name: &str, arguments: &str) -> String {
@@ -138,12 +198,15 @@ impl ReactLoop {
 
     async fn finalize(
         &mut self,
+        context: &mut ExecuteContext,
         on_token: &mut (impl FnMut(usize, &str) + Send),
     ) -> anyhow::Result<String> {
         self.history
             .user("请基于以上信息给出最终回答，不要再调用任何工具。")?;
 
         let turn = self.max_turns + 1;
+        context.set_turn(turn);
+
         let reply = self
             .completer
             .stream(self.history.as_slice(), None, &mut |token| {
@@ -155,8 +218,25 @@ impl ReactLoop {
         if answer.trim().is_empty() {
             anyhow::bail!("收尾轮返回了空内容");
         }
+        context.push_event(Event::new(
+            EventName::Answer,
+            answer.clone(),
+            Role::Assistant,
+        ));
         self.history.assistant(&answer, Vec::new())?;
         Ok(answer)
+    }
+}
+
+fn observe(context: &ExecuteContext) {
+    let payload = serde_json::json!({
+        "id": context.id().to_string(),
+        "events": context.events(),
+    });
+
+    match serde_json::to_string_pretty(&payload) {
+        Ok(json) => tracing::info!("execute context\n{json}"),
+        Err(error) => tracing::warn!(%error, "execute context 序列化失败"),
     }
 }
 
@@ -300,7 +380,7 @@ mod tests {
 
     fn build_with_max_turns(completer: Arc<dyn Completer>, max_turns: usize) -> ReactLoop {
         let mut tools = ToolHashMap::new();
-        tools.insert("echo".to_owned(), Box::new(EchoTool) as Box<dyn Tool>);
+        tools.insert("echo".to_owned(), Arc::new(EchoTool) as Arc<dyn Tool>);
         ReactLoop::new(completer, tools, "你是测试助手。", max_turns).expect("构造 ReactLoop 失败")
     }
 
@@ -468,5 +548,20 @@ mod tests {
 
         assert_eq!(outcome.answer, "补上了");
         assert_eq!(outcome.turns, 2);
+    }
+
+    #[tokio::test]
+    async fn execute_flattens_failures_into_observations() {
+        let agent = build(ScriptedCompleter::new(Vec::new()));
+
+        assert_eq!(
+            agent.execute("echo", r#"{"q":"hi"}"#).await,
+            r#"echo:{"q":"hi"}"#
+        );
+
+        let failed = agent.execute("echo", r#"{"q":"boom"}"#).await;
+        assert!(failed.contains("工具执行失败"));
+
+        assert_eq!(agent.execute("nope", "{}").await, "未知工具：nope");
     }
 }
