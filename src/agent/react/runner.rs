@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use async_openai::types::chat::{ChatCompletionMessageToolCalls, ChatCompletionRequestMessage};
+use async_openai::types::chat::{
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
+    FunctionCall,
+};
 use tracing::info;
 
 use crate::agent::llm::models::{Completer, Reply};
@@ -94,6 +97,90 @@ impl ReactLoop {
         on_step: &mut impl FnMut(&Step),
         on_token: &mut (impl FnMut(usize, &str) + Send),
     ) -> anyhow::Result<Option<Outcome>> {
+        let Reply {
+            content,
+            tool_calls,
+        } = self
+            .thinking(turn, &mut *context, &mut *on_step, &mut *on_token)
+            .await?;
+
+        if content.is_empty() && tool_calls.is_empty() {
+            self.history.assistant(&content, tool_calls)?;
+            return Ok(Some(Outcome {
+                answer: content,
+                turns: turn,
+                termination: Termination::EmptyReply,
+            }));
+        }
+
+        self.history.assistant(&content, tool_calls.clone())?;
+
+        if tool_calls.is_empty() {
+            return Ok(answer(content, turn, context, on_step));
+        }
+
+        for call in &tool_calls {
+            let ChatCompletionMessageToolCalls::Function(func_call) = call else {
+                continue;
+            };
+            let func = &func_call.function;
+            let observation = self.action(func, turn, context, on_step).await;
+            self.on_observation(func_call, observation, turn, context, on_step)?;
+        }
+
+        Ok(None)
+    }
+
+    fn on_observation(
+        &mut self,
+        func_call: &ChatCompletionMessageToolCall,
+        observation: String,
+        turn: usize,
+        context: &mut ExecuteContext,
+        on_step: &mut impl FnMut(&Step),
+    ) -> anyhow::Result<()> {
+        on_step(&Step::Observation {
+            turn,
+            name: func_call.function.name.clone(),
+            output: observation.clone(),
+        });
+        context.push_event(Event::new(
+            EventName::ToolResult,
+            observation.clone(),
+            Role::Tool,
+        ));
+        self.history.tool(&func_call.id, &observation)?;
+        Ok(())
+    }
+
+    async fn action(
+        &mut self,
+        func: &FunctionCall,
+        turn: usize,
+        context: &mut ExecuteContext,
+        on_step: &mut impl FnMut(&Step),
+    ) -> String {
+        on_step(&Step::Action {
+            turn,
+            name: func.name.clone(),
+            arguments: func.arguments.clone(),
+        });
+        context.push_event(Event::new(
+            EventName::ToolCall,
+            func.arguments.clone(),
+            Role::Assistant,
+        ));
+
+        self.execute(&func.name, &func.arguments).await
+    }
+
+    async fn thinking(
+        &mut self,
+        turn: usize,
+        context: &mut ExecuteContext,
+        on_step: &mut impl FnMut(&Step),
+        on_token: &mut (impl FnMut(usize, &str) + Send),
+    ) -> anyhow::Result<Reply> {
         let reply = self
             .completer
             .stream(self.history.as_slice(), Some(&self.tools), &mut |token| {
@@ -101,89 +188,21 @@ impl ReactLoop {
             })
             .await?;
 
-        let Reply {
-            content: thought,
-            tool_calls: calls,
-        } = reply;
-
-        if thought.trim().is_empty() && calls.is_empty() {
-            on_step(&Step::Nudge {
-                turn,
-                reason: "模型返回了空回复".to_owned(),
-            });
-            self.history
-                .user("你上一条回复是空的。请继续，或直接给出最终答案。")?;
-            return Ok(None);
-        }
-
-        self.history.assistant(&thought, calls.clone())?;
-
-        if calls.is_empty() {
-            if !thought.is_empty() {
-                on_step(&Step::Answer {
-                    turn,
-                    content: thought.clone(),
-                });
-            }
-            context.push_event(Event::new(
-                EventName::Answer,
-                thought.clone(),
-                Role::Assistant,
-            ));
-            return Ok(Some(Outcome {
-                answer: thought,
-                turns: turn,
-                termination: Termination::ModelFinished,
-            }));
-        }
-
-        if !thought.is_empty() {
+        // content非空, tool_calls非空 -> content = thought
+        // content非空, tool_calls为空 -> content = answer
+        if !reply.content.is_empty() && !reply.tool_calls.is_empty() {
             on_step(&Step::Thought {
                 turn,
-                content: thought.clone(),
+                content: reply.content.clone(),
             });
             context.push_event(Event::new(
                 EventName::Thought,
-                thought.clone(),
+                reply.content.clone(),
                 Role::Assistant,
             ));
         }
 
-        for call in &calls {
-            let ChatCompletionMessageToolCalls::Function(func_call) = call else {
-                continue;
-            };
-            let name = func_call.function.name.clone();
-            let arguments = func_call.function.arguments.clone();
-
-            on_step(&Step::Action {
-                turn,
-                name: name.clone(),
-                arguments: arguments.clone(),
-            });
-            context.push_event(Event::new(
-                EventName::ToolCall,
-                arguments.clone(),
-                Role::Assistant,
-            ));
-
-            let output = self.execute(&name, &arguments).await;
-
-            on_step(&Step::Observation {
-                turn,
-                name: name.clone(),
-                output: output.clone(),
-            });
-            context.push_event(Event::new(
-                EventName::ToolResult,
-                output.clone(),
-                Role::Tool,
-            ));
-
-            self.history.tool(&func_call.id, &output)?;
-        }
-
-        Ok(None)
+        Ok(reply)
     }
 
     async fn execute(&self, name: &str, arguments: &str) -> String {
@@ -226,6 +245,28 @@ impl ReactLoop {
         self.history.assistant(&answer, Vec::new())?;
         Ok(answer)
     }
+}
+
+fn answer(
+    content: String,
+    turn: usize,
+    context: &mut ExecuteContext,
+    on_step: &mut impl FnMut(&Step),
+) -> Option<Outcome> {
+    on_step(&Step::Answer {
+        turn,
+        content: content.clone(),
+    });
+    context.push_event(Event::new(
+        EventName::Answer,
+        content.clone(),
+        Role::Assistant,
+    ));
+    Some(Outcome {
+        answer: content,
+        turns: turn,
+        termination: Termination::ModelFinished,
+    })
 }
 
 fn observe(context: &ExecuteContext) {
@@ -535,19 +576,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_reply_is_nudged() {
-        let mut agent = build(ScriptedCompleter::new(vec![
-            Reply::default(),
-            answer("补上了"),
-        ]));
+    async fn empty_reply_ends_the_loop_with_an_empty_message() {
+        let mut agent = build(ScriptedCompleter::new(vec![Reply::default()]));
 
         let outcome = agent
             .run("问题", |_| {}, |_, _| {})
             .await
-            .expect("空回复应当被推一把");
+            .expect("空回复应当收束循环");
 
-        assert_eq!(outcome.answer, "补上了");
-        assert_eq!(outcome.turns, 2);
+        assert_eq!(outcome.answer, "");
+        assert_eq!(outcome.turns, 1);
+        assert_eq!(outcome.termination, Termination::EmptyReply);
+
+        let last = agent.history().last().expect("历史至少有一条消息");
+        assert!(
+            matches!(last, ChatCompletionRequestMessage::Assistant(message) if message.content.is_none()),
+            "空回复要在历史末尾留下一条空的 assistant 消息"
+        );
     }
 
     #[tokio::test]

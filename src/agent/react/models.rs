@@ -30,6 +30,7 @@ pub enum Step {
 pub enum Termination {
     ModelFinished,
     MaxTurns,
+    EmptyReply,
 }
 
 #[derive(Debug)]
