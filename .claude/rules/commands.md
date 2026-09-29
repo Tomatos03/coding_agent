@@ -20,38 +20,46 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 
 ## 测试
 
-**当前 60 个测试**：默认跑 57 个（全部离线，不联网、不需要凭证），另外 3 个是 `#[ignore]` 的 MCP 集成测试（需要本机 `python3`）。
+**当前 80 个测试**：默认跑 77 个（全部离线，不联网、不需要凭证），另外 3 个是 `#[ignore]` 的 MCP 集成测试（需要本机 `python3`）。
 
-`src/agent/react/runner.rs` 9 个，覆盖循环逻辑：
+`src/agent/react/runner.rs` 17 个，覆盖循环逻辑：
 
-- 模型直接给答案 → `turns == 1`，`Termination::ModelFinished`
-- 一轮工具后给答案 → tool 消息按序进了历史
+- 调 `final_answer` → `Termination::FinalAnswer`，答案取 `execute` 的返回值，且该调用有配对 tool 消息
+- 纯文本回复（无 tool_calls）→ 端点无视了 `required`，降级为 `Termination::ModelFinished`；同时断言循环内收到的策略是 `Required`
+- 一轮工具后调 `final_answer` → tool 消息按序进了历史
 - 工具执行失败 → 循环没断，错误进了 Observation
 - 未知工具名 → 同上
-- 连续请求工具 → 撞上限，`Termination::MaxTurns`，**仍返回答案**
+- `final_answer` 参数非法 → 压成 Observation、本轮不终止，下一轮重试后才收尾
+- 同轮既调别的工具又调 `final_answer` → 以 `final_answer` 为准，且**每个** call 都有配对 tool 消息
+- 连续请求工具 → 撞上限，`Termination::MaxTurns`，收尾轮**用 `Force("final_answer")` 强制**并发出 `Step::Answer`；断言完整策略序列 `[Required, Required, Force(...)]`
+- 撞上限的收尾轮**只把 `final_answer` 暴露给模型**（工具面裁剪），断言两次请求的工具名序列
+- 端点无视具名强制、收尾轮只回 `content` → 退回把 `content` 当答案；`content` 也空 → 交付固定兜底文案，**不报错**
+- 收尾轮的 `final_answer` 参数非法 → 一样软着陆（退回 `content`/兜底文案），不因收尾失败丢掉整轮结果
 - 模型返回空回复（content 与 tool_calls 都为空）→ 立即以 `Termination::EmptyReply` 收束，`turns` 为当前轮，历史末尾留下一条空 assistant 消息
-- `execute()` 把工具失败与未知工具名压成观察文案（「工具执行失败：…」/「未知工具：…」）
-- **收尾轮的 content 发 `Step::Answer` 而非 `Thought`** → 断言完整的事件序列 `[(1,action),(1,observation),(2,answer)]`
+- `execute()` 把工具失败与未知工具名压成观察文案（「工具执行失败：…」/「未知工具：…」），并能执行 `final_answer`（输入即输出）
+- **收尾轮发 `Step::Answer` 而非 `Thought`** → 断言完整事件序列 `[(1,action),(1,observation),(2,answer)]`
 - **中间轮的 content 发 `Step::Thought`** → 断言 `[(1,thought),(1,action),(1,observation),(2,answer)]`
 
 后两条用 `trace()` 辅助函数把 `Step` 压成 `(轮次, 类型)` 序列做整体比对——比逐个 `assert!(matches!(...))` 更能钉住**顺序**，而这两条的核心正是发射顺序。
 
 `src/agent/react/context.rs` 6 个：`ExecuteContext` 每次构造拿到唯一 id 且初始 `Running`、`set_status` 的状态流转、`Event` 记录 name/content/role/timestamp、事件序列化为平铺 JSON（毫秒时间戳）、`set_turn` 只保留当前轮事件、事件保持插入顺序。
 
-`src/agent/llm/models.rs` 3 个，覆盖流式分片重组（`ToolCallAccumulator`）：
+`src/agent/llm/models.rs` 9 个：
 
-- 单个调用的 `arguments` 被切成 4 片 → 拼回完整字符串
-- 两个调用的分片交错到达 → 各归各的槽位，互不串味
-- 中间有空槽位 → `finish()` 丢掉没拿到 `name` 的
+- 流式分片重组（`ToolCallAccumulator`）3 个：单个调用的 `arguments` 被切成 4 片 → 拼回完整字符串；两个调用的分片交错到达 → 各归各的槽位；中间有空槽位 → `finish()` 丢掉没拿到 `name` 的
+- 策略 → 请求体 3 个（`build_chat_request` 纯函数，序列化后断言）：`Required` → `tool_choice == "required"` 且 `parallel_tool_calls == true`；`Force("final_answer")` → `tool_choice == {"type":"function",...}`；**`tools == None` 时 `tool_choice` 键必须消失**（否则 `required` + 零工具会被服务端 400 拒绝）
+- `tool_choice` 被拒判定 3 个：400 + `param:"tool_choice"`（或消息里点名）命中；429 / 500 / 不相关的 400 不命中；只有非 `Auto` 策略才值得重发
+
+`src/tools/local/final_answer/mod.rs` 5 个：`execute` 把输入参数原样返回、可重复调用（纯函数）、`extract_answer` 容忍首尾空白、拒绝非法 JSON / 缺字段 / 空串、`execute` 传播解析错误。
 
 MCP 相关共 32 个：
 
 - `src/tools/mcp/config.rs` 10 个：配置解析、默认值、非法字段/名字/超时拒绝、缺文件回退
 - `src/tools/mcp/tool.rs` 14 个（1 个 ignored）：结果映射、参数解析、命名校验、适配器端到端调用
 - `src/tools/mcp/connection.rs` 5 个（1 个 ignored）：`Send + Sync`、空配置、失败隔离、真实 server 工具发现
-- `src/tools/mod.rs` 3 个（1 个 ignored）：重名去重、空配置只含本地工具、连接在注册后仍存活
+- `src/tools/mod.rs` 3 个（1 个 ignored）：重名去重、空配置含 `web_search` + `final_answer` 两个本地工具、连接在注册后仍存活
 
-GAIA 相关 10 个（全部离线）：`src/gaia/solver.rs` 6 个（严格 JSON / 代码块与正文包裹 / 字符串内花括号 / 纯文本兜底 / 空内容报错 / 无平衡对象），`src/gaia/report.rs` 2 个（按模型×模式汇总、通过率边界），`src/gaia/evaluator.rs` 1 个（脚本化 `Completer` 跑通带工具的 ReAct 路径并统计工具调用次数），`src/gaia/models.rs` 1 个（`schemars` 的 `deny_unknown_fields` 只作用于 JSON Schema，serde 侧仍忽略未知字段）。
+GAIA 相关 11 个（全部离线）：`src/gaia/solver.rs` 6 个（严格 JSON / 代码块与正文包裹 / 字符串内花括号 / 纯文本兜底 / 空内容报错 / 无平衡对象），`src/gaia/report.rs` 2 个（按模型×模式汇总、通过率边界），`src/gaia/evaluator.rs` 2 个（脚本化 `Completer` 跑通带工具的 ReAct 路径并统计工具调用次数；**`final_answer` 不计入工具调用**），`src/gaia/models.rs` 1 个（`schemars` 的 `deny_unknown_fields` 只作用于 JSON Schema，serde 侧仍忽略未知字段）。
 
 3 个 `#[ignore]` 都需要 `python3` + `tests/fixtures/fake_mcp_server.py`，跑法：
 

@@ -2,6 +2,8 @@
 //!
 //! 新增本地工具时，在 `local/` 下创建子目录，并在本文件声明 `pub mod <name>;`。
 
+pub mod final_answer;
 pub mod web_search;
 
+pub use final_answer::{FINAL_ANSWER_TOOL, FinalAnswer};
 pub use web_search::WebSearch;

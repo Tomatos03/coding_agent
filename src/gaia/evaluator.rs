@@ -86,7 +86,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::agent::llm::models::Reply;
+    use crate::agent::llm::models::{Reply, ToolPolicy};
+    use crate::tools::local::final_answer::{FINAL_ANSWER_TOOL, FinalAnswer};
     use crate::tools::tool::Tool;
 
     struct ScriptedCompleter {
@@ -115,6 +116,7 @@ mod tests {
             &self,
             _messages: &[ChatCompletionRequestMessage],
             _tools: Option<&ToolHashMap>,
+            _policy: ToolPolicy,
         ) -> anyhow::Result<Reply> {
             self.next()
         }
@@ -123,6 +125,7 @@ mod tests {
             &self,
             _messages: &[ChatCompletionRequestMessage],
             _tools: Option<&ToolHashMap>,
+            _policy: ToolPolicy,
             on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
         ) -> anyhow::Result<Reply> {
             let reply = self.next()?;
@@ -169,12 +172,24 @@ mod tests {
         }
     }
 
+    /// required 下模型唯一的收尾方式：把 GAIA 的 JSON 对象作为 `answer` 参数传给 `final_answer`。
     fn answer_reply(final_answer: &str) -> Reply {
         Reply {
-            content: format!(
-                r#"{{"is_solvable":true,"unsolvable_reason":"","final_answer":"{final_answer}"}}"#
-            ),
-            tool_calls: Vec::new(),
+            content: String::new(),
+            tool_calls: vec![ChatCompletionMessageToolCalls::Function(
+                ChatCompletionMessageToolCall {
+                    id: "call_2".to_owned(),
+                    function: FunctionCall {
+                        name: FINAL_ANSWER_TOOL.to_owned(),
+                        arguments: json!({
+                            "answer": format!(
+                                r#"{{"is_solvable":true,"unsolvable_reason":"","final_answer":"{final_answer}"}}"#
+                            )
+                        })
+                        .to_string(),
+                    },
+                },
+            )],
         }
     }
 
@@ -190,6 +205,11 @@ mod tests {
     fn tools() -> ToolHashMap {
         let mut tools = ToolHashMap::new();
         tools.insert("echo".to_owned(), Arc::new(EchoTool) as Arc<dyn Tool>);
+        // 手工拼表同样要显式注册 final_answer：收尾轮会以 tool_choice 具名强制它。
+        tools.insert(
+            FINAL_ANSWER_TOOL.to_owned(),
+            Arc::new(FinalAnswer) as Arc<dyn Tool>,
+        );
         tools
     }
 
@@ -201,7 +221,23 @@ mod tests {
 
         assert!(result.correct);
         assert_eq!(result.mode, GaiaMode::WithTools);
-        assert_eq!(result.tool_calls, Some(1));
+        assert_eq!(result.tool_calls, Some(1), "echo 是一次真正的工具使用");
+        assert_eq!(result.prediction.as_deref(), Some("Paris"));
+    }
+
+    #[tokio::test]
+    async fn final_answer_is_not_counted_as_a_tool_call() {
+        // 模型全程没碰真工具，只靠 final_answer 收尾：口径应报 0 次工具使用。
+        let completer = ScriptedCompleter::new(vec![answer_reply("Paris")]);
+
+        let result = evaluate_gaia_with_tools(problem(), "m", completer, tools()).await;
+
+        assert!(result.correct);
+        assert_eq!(
+            result.tool_calls,
+            Some(0),
+            "final_answer 是收尾动作，不该被算成一次工具使用"
+        );
         assert_eq!(result.prediction.as_deref(), Some("Paris"));
     }
 }

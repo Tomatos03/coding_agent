@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 从零手写的 coding agent（Rust 2024 edition，crate 名 `coding_agent`）。目标形态是「模型请求 → 工具调用 → 结果回填」的自主循环。
 
-**ReAct 主循环已落地**：`src/agent/react/runner.rs` 的 `ReactLoop`——思考 → 行动 → 观察，模型不再请求工具即结束；撞轮次上限则去掉工具再收尾一轮，而不是报错退出。
+**ReAct 主循环已落地**：`src/agent/react/runner.rs` 的 `ReactLoop`——思考 → 行动 → 观察。循环内每轮 `tool_choice=required`，最终答案被抽象成 `final_answer` 工具（`execute` 输入即输出），因此模型只能通过调用它来结束；撞轮次上限则用 `tool_choice` 具名强制 `final_answer` 收尾，而不是报错退出。
 
 **MCP 工具支持已落地**：`src/tools/mcp/` 通过 **stdio** 启动本地 MCP server、发现工具并适配成本地 `Tool`（一期仅 `tools`、仅 stdio）。本地（进程内）工具放在 `src/tools/local/`，每个工具一个子目录。
 
@@ -33,7 +33,7 @@ src/tools/         工具层：spec / execute
 
 | 模块 | 职责 |
 |---|---|
-| `src/agent/llm/models.rs` | `LLMClient`：只持有 model 名与 `async_openai::Client`。`Completer` trait 有 `complete`（一次性）与 `stream`（逐 token 回调）两个方法，都返回领域类型 `Reply`（`content` + `tool_calls`）。**从具体类型调用 trait 方法要 `use Completer`**。`Completer` 同时是编排层唯一依赖的接口与测试的接缝 |
+| `src/agent/llm/models.rs` | `LLMClient`：只持有 model 名与 `async_openai::Client`。`Completer` trait 有 `complete`（一次性）与 `stream`（逐 token 回调）两个方法，都接收 `ToolPolicy`（`Auto` / `Required` / `Force(工具名)`，请求级 `tool_choice`）并返回领域类型 `Reply`（`content` + `tool_calls`）。端点以 400 拒绝 `tool_choice` 时用粘性 `AtomicBool` 标记并降级为 `Auto` 重发一次。**从具体类型调用 trait 方法要 `use Completer`**。`Completer` 同时是编排层唯一依赖的接口与测试的接缝 |
 | `src/agent/llm/provider.rs` | provider 选择、`client_config()`、模型 ID 读取、schema 降级提示 |
 | `src/agent/llm/semaphore.rs` | 进程级并发闸门（3 permits），**由调用方负责获取** |
 | `src/agent/react/runner.rs` | `ReactLoop`：循环推进、工具派发、终止判定。`run` 同时接收 `on_step` 与 `on_token` 两个回调（原 `run_stream` 已并入 `run`） |
@@ -41,6 +41,7 @@ src/tools/         工具层：spec / execute
 | `src/agent/react/models.rs` | 编排层词汇：`Step` / `Termination` / `Outcome` / `DEFAULT_MAX_TURNS` |
 | `src/tools/tool.rs` | `Tool` trait：`name` / `description` / `parameters` / `execute`；`definition()` 是默认实现，产出 wire format |
 | `src/tools/local/web_search/mod.rs` | web_search 工具：参数/响应类型与 `Tool` 实现合并在一个文件 |
+| `src/tools/local/final_answer/mod.rs` | final_answer 工具：最终答案的收尾通道。`execute` **输入即输出**（原样返回 `answer` 参数），`extract_answer` 供循环做终止判定 |
 | `src/tools/mcp/config.rs` | 读取并校验 `mcp.json`（`McpConfig` / `McpServerConfig`） |
 | `src/tools/mcp/connection.rs` | `McpConnection`、`connect` / `connect_all`：启动子进程、握手、`tools/list`、失败隔离与子进程 keep-alive |
 | `src/tools/mcp/tool.rs` | `McpTool`：远端工具 -> 本地 `Tool` 适配（命名、调用、`CallToolResult` 映射） |

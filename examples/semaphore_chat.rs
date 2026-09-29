@@ -1,7 +1,7 @@
 use coding_agent::{
     agent::{
         llm::{
-            models::{Completer, LLMClient},
+            models::{Completer, LLMClient, ToolPolicy},
             semaphore::get_semaphore,
         },
         react::history::History,
@@ -28,7 +28,13 @@ async fn main() -> anyhow::Result<()> {
 
             let client = LLMClient::new();
             let reply = client
-                .stream(history.as_slice(), None, &mut |token| print!("{token}"))
+                .stream(
+                    history.as_slice(),
+                    None,
+                    // 没声明工具，策略被忽略。
+                    ToolPolicy::Auto,
+                    &mut |token| print!("{token}"),
+                )
                 .await?;
 
             drop(permit);

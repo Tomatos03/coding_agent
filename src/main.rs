@@ -1,4 +1,4 @@
-use coding_agent::agent::llm::models::{Completer, LLMClient};
+use coding_agent::agent::llm::models::{Completer, LLMClient, ToolPolicy};
 use coding_agent::agent::react::history::History;
 use coding_agent::bootstrap::init;
 
@@ -11,7 +11,10 @@ async fn main() -> anyhow::Result<()> {
     history.user("请你计算 5 * 10 / 5 的结果，只回一个数字。")?;
 
     let client = LLMClient::new();
-    let reply = client.complete(history.as_slice(), None).await?;
+    // 没有声明工具，策略实际被忽略（请求体不会带 tool_choice）。
+    let reply = client
+        .complete(history.as_slice(), None, ToolPolicy::Auto)
+        .await?;
 
     println!("Response: {}", reply.content);
     Ok(())

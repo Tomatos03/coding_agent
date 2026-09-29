@@ -2,7 +2,7 @@
 //!
 //! 用脚本化的 `Completer` 代替真实 LLM，因此**无需任何凭证、可离线运行**：
 //! - 第 1 轮：模型请求调用 MCP 工具 `{server}__echo`；
-//! - 第 2 轮：模型基于工具观察给出最终答案。
+//! - 第 2 轮：模型根据工具观察调用 `final_answer` 收尾（循环内每轮 `tool_choice=required`）。
 //!
 //! 运行（需要本机 python3）：
 //!   cargo run --example mcp_react
@@ -15,11 +15,12 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
     FunctionCall,
 };
-use coding_agent::agent::llm::models::{Completer, Reply};
+use coding_agent::agent::llm::models::{Completer, Reply, ToolPolicy};
 use coding_agent::agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::agent::react::runner::ReactLoop;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
+use coding_agent::tools::local::final_answer::FINAL_ANSWER_TOOL;
 use coding_agent::tools::mcp::{McpConfig, McpServerConfig};
 use coding_agent::tools::{ToolHashMap, build_tools_with};
 
@@ -50,6 +51,7 @@ impl Completer for ScriptedCompleter {
         &self,
         _messages: &[ChatCompletionRequestMessage],
         _tools: Option<&ToolHashMap>,
+        _policy: ToolPolicy,
     ) -> anyhow::Result<Reply> {
         self.next()
     }
@@ -58,6 +60,7 @@ impl Completer for ScriptedCompleter {
         &self,
         _messages: &[ChatCompletionRequestMessage],
         _tools: Option<&ToolHashMap>,
+        _policy: ToolPolicy,
         on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
     ) -> anyhow::Result<Reply> {
         let reply = self.next()?;
@@ -138,10 +141,21 @@ async fn main() -> anyhow::Result<()> {
     let completer = ScriptedCompleter::new(vec![
         // 第 1 轮：模型决定调用 MCP 工具。
         mcp_tool_call(&echo_tool, &arguments),
-        // 第 2 轮：模型根据 Observation 给出最终答案。
+        // 第 2 轮：模型根据 Observation 调用 final_answer 收尾（required 下唯一的终止方式）。
         Reply {
-            content: "MCP 链路已打通：echo 工具成功返回了结果。".to_owned(),
-            tool_calls: Vec::new(),
+            content: String::new(),
+            tool_calls: vec![ChatCompletionMessageToolCalls::Function(
+                ChatCompletionMessageToolCall {
+                    id: "call_final_1".to_owned(),
+                    function: FunctionCall {
+                        name: FINAL_ANSWER_TOOL.to_owned(),
+                        arguments: serde_json::json!({
+                            "answer": "MCP 链路已打通：echo 工具成功返回了结果。"
+                        })
+                        .to_string(),
+                    },
+                },
+            )],
         },
     ]);
 

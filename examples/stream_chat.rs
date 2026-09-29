@@ -1,4 +1,4 @@
-use coding_agent::agent::llm::models::{Completer, LLMClient};
+use coding_agent::agent::llm::models::{Completer, LLMClient, ToolPolicy};
 use coding_agent::agent::react::history::History;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
@@ -13,7 +13,9 @@ async fn main() -> anyhow::Result<()> {
 
     let client = LLMClient::new();
     client
-        .stream(history.as_slice(), None, &mut |token| print!("{token}"))
+        .stream(history.as_slice(), None, ToolPolicy::Auto, &mut |token| {
+            print!("{token}")
+        })
         .await?;
 
     println!();

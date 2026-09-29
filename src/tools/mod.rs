@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_openai::types::chat::ChatCompletionTools;
 
 use crate::tools::{
-    local::WebSearch,
+    local::{FinalAnswer, WebSearch},
     mcp::{McpConfig, connect_all, load_config, tools_from_connection},
     tool::Tool,
 };
@@ -60,7 +60,8 @@ pub async fn build_tools_with(config: McpConfig) -> anyhow::Result<ToolHashMap> 
 }
 
 fn local_tools() -> Vec<Box<dyn Tool>> {
-    vec![Box::new(WebSearch)]
+    // `final_answer` 也在这里注册：它必须出现在发给模型的定义里，收尾轮才能强制调用它。
+    vec![Box::new(WebSearch), Box::new(FinalAnswer)]
 }
 
 /// 先到先得：重名工具跳过并告警（本地工具先注册，因此本地优先）。
@@ -127,7 +128,11 @@ mod tests {
             .expect("空配置应成功");
 
         assert!(registry.contains_key("web_search"), "应注册本地 web_search");
-        assert_eq!(registry.len(), 1);
+        assert!(
+            registry.contains_key("final_answer"),
+            "应注册本地 final_answer"
+        );
+        assert_eq!(registry.len(), 2);
     }
 
     #[tokio::test]

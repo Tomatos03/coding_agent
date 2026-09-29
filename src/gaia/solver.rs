@@ -11,6 +11,7 @@ use crate::agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use crate::agent::react::runner::ReactLoop;
 use crate::gaia::models::GaiaOutput;
 use crate::tools::ToolHashMap;
+use crate::tools::local::final_answer::FINAL_ANSWER_TOOL;
 
 pub const GAIA_PROMPT: &str = r#"You are a general AI assistant. I will ask you a question.
 First, determine if you can solve this problem with your current capabilities and set "is_solvable" accordingly.
@@ -25,13 +26,13 @@ Respond with a single JSON object containing exactly these keys: "is_solvable" (
 
 pub const GAIA_TOOLS_PROMPT: &str = r#"You are a general AI assistant with access to tools. I will ask you a question.
 Use the provided tools whenever they can help you gather facts or compute the answer (for example web_search). Call a tool only when it is useful; otherwise work it out yourself.
-Once you have enough information, stop calling tools and reply with the final answer, and nothing else, as the JSON object described below.
+Once you have enough information, call the final_answer tool and pass the single JSON object described below as its "answer" argument (a JSON string). Do not call any other tool in that same turn.
 Your final answer should be a number OR as few words as possible OR a comma-separated list of numbers and/or strings.
 If you are asked for a number, don't use a comma to write your number neither use units such as $ or percent sign unless specified otherwise.
 If you are asked for a string, don't use articles, neither abbreviations (e.g., for cities), and write the digits in plain text.
 If you are asked for a comma-separated list, apply the above rules depending on whether the element is a number or a string.
 First determine if the question is solvable with your current capabilities and set "is_solvable" accordingly.
-When you are done, respond with a single JSON object containing exactly these keys: "is_solvable" (boolean), "unsolvable_reason" (string, empty when is_solvable is true), "final_answer" (string).
+The JSON object must contain exactly these keys: "is_solvable" (boolean), "unsolvable_reason" (string, empty when is_solvable is true), "final_answer" (string).
 "#;
 
 pub async fn solve_gaia_question_with_retry(
@@ -74,7 +75,11 @@ pub async fn solve_gaia_question_with_tools(
         .run(
             prompt,
             |step| {
-                if matches!(step, Step::Action { .. }) {
+                // `final_answer` 是收尾动作，不是真正的工具使用，不能算进
+                // 「带工具这一组是否真的用上了工具」的口径里。
+                if let Step::Action { name, .. } = step
+                    && name != FINAL_ANSWER_TOOL
+                {
                     tool_calls += 1;
                 }
             },

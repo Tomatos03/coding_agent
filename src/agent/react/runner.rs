@@ -6,11 +6,12 @@ use async_openai::types::chat::{
 };
 use tracing::info;
 
-use crate::agent::llm::models::{Completer, Reply};
+use crate::agent::llm::models::{Completer, Reply, ToolPolicy};
 use crate::agent::react::context::{Event, EventName, ExecuteContext, Role, Status};
 use crate::agent::react::history::History;
 use crate::agent::react::models::{Outcome, Step, Termination};
 use crate::tools::ToolHashMap;
+use crate::tools::local::final_answer::{self, FINAL_ANSWER_TOOL};
 
 pub struct ReactLoop {
     completer: Arc<dyn Completer>,
@@ -20,6 +21,9 @@ pub struct ReactLoop {
 }
 
 impl ReactLoop {
+    /// `tools` 必须包含 `final_answer`：收尾轮会以 `tool_choice` 具名强制调用它，
+    /// 缺失时服务端会因函数未声明而拒绝。用 [`crate::tools::build_tools`] 构建的
+    /// 工具表天然满足；手工拼表的调用方需自行注册。
     pub fn new(
         completer: Arc<dyn Completer>,
         tools: ToolHashMap,
@@ -82,7 +86,7 @@ impl ReactLoop {
         }
 
         context.set_status(Status::Completed);
-        let answer = self.finalize(context, on_token).await?;
+        let answer = self.finalize(context, on_step, on_token).await?;
         Ok(Outcome {
             answer,
             turns: self.max_turns,
@@ -104,27 +108,58 @@ impl ReactLoop {
             .thinking(turn, &mut *context, &mut *on_step, &mut *on_token)
             .await?;
 
-        if content.is_empty() && tool_calls.is_empty() {
-            self.history.assistant(&content, tool_calls)?;
-            return Ok(Some(Outcome {
-                answer: content,
-                turns: turn,
-                termination: Termination::EmptyReply,
-            }));
+        // 只把能执行、能配对的 function 调用落库：`Custom` 等变体本仓库无法处理，
+        // 写进去只会留下无人应答的 tool_call，让历史结构非法。
+        let calls = function_calls(&tool_calls);
+
+        self.history.assistant(&content, calls.clone())?;
+
+        if calls.is_empty() {
+            if content.is_empty() {
+                tracing::warn!("模型在 required 下既没有 tool_calls 也没有内容");
+                return Ok(Some(Outcome {
+                    answer: content,
+                    turns: turn,
+                    termination: Termination::EmptyReply,
+                }));
+            }
+
+            // `required` 下服务端必须给出 tool_call；走到这里通常是端点无视了
+            // tool_choice（也可能是本轮只有非 function 类型的调用，已在上文过滤掉）。
+            // 已经拿到一段完整文本，直接当答案收尾，别把它浪费掉。
+            tracing::warn!("端点无视 tool_choice=required，按纯文本答案处理");
+            return Ok(answer(
+                content,
+                turn,
+                context,
+                on_step,
+                Termination::ModelFinished,
+            ));
         }
 
-        self.history.assistant(&content, tool_calls.clone())?;
-
-        if tool_calls.is_empty() {
-            return Ok(answer(content, turn, context, on_step));
+        // `final_answer` 是「交付」而不是工具：参数即答案，不执行、不发 Observation。
+        // 判据与顺序无关——本轮只要出现参数合法的调用就交付；同轮其它调用一律不执行
+        // （答案已定，副作用不该再发生），但都要补上配对 tool 消息（见 `pair_delivery`）。
+        if let Some((delivered, text)) = find_final_answer(&calls) {
+            self.pair_delivery(context, &calls, delivered, &text)?;
+            return Ok(answer(
+                text,
+                turn,
+                context,
+                on_step,
+                Termination::FinalAnswer,
+            ));
         }
 
-        for call in &tool_calls {
+        for call in &calls {
+            // `function_calls` 已保证只剩 Function 变体。
             let ChatCompletionMessageToolCalls::Function(func_call) = call else {
                 continue;
             };
-            let func = &func_call.function;
-            let observation = self.action(func, turn, context, on_step).await;
+
+            let observation = self
+                .action(&func_call.function, turn, context, on_step)
+                .await;
             self.on_observation(func_call, observation, turn, context, on_step)?;
         }
 
@@ -150,6 +185,46 @@ impl ReactLoop {
             Role::Tool,
         ));
         self.history.tool(&func_call.id, &observation)?;
+        Ok(())
+    }
+
+    /// 交付路径的历史落库：为本轮每个 `tool_call` 补一条配对 tool 消息。
+    ///
+    /// - `delivered` 那条写答案本身，历史因此始终可重放；
+    /// - 其余调用从未执行，写 [`SKIPPED_CALL_NOTE`] 占位说明原因；
+    /// - 这里一个工具都不执行，所以不发 `Step`——交付只有一个 `Step::Answer`。
+    fn pair_delivery(
+        &mut self,
+        context: &mut ExecuteContext,
+        calls: &[ChatCompletionMessageToolCalls],
+        delivered: &ChatCompletionMessageToolCall,
+        answer: &str,
+    ) -> anyhow::Result<()> {
+        let mut skipped = Vec::new();
+        for call in calls {
+            let ChatCompletionMessageToolCalls::Function(func) = call else {
+                continue;
+            };
+            let content;
+            if func.id == delivered.id {
+                self.history.tool(&func.id, answer)?;
+                content = answer;
+            } else {
+                self.history.tool(&func.id, SKIPPED_CALL_NOTE)?;
+                skipped.push(func.function.name.clone());
+                content = SKIPPED_CALL_NOTE;
+            }
+            context.push_event(Event::new(EventName::ToolResult, content, Role::Tool));
+        }
+
+        if !skipped.is_empty() {
+            tracing::warn!(
+                "final_answer 已交付，同轮 {} 个调用未执行：{}",
+                skipped.len(),
+                skipped.join(", ")
+            );
+        }
+
         Ok(())
     }
 
@@ -183,13 +258,16 @@ impl ReactLoop {
     ) -> anyhow::Result<Reply> {
         let reply = self
             .completer
-            .stream(self.history.as_slice(), Some(&self.tools), &mut |token| {
-                on_token(turn, token)
-            })
+            .stream(
+                self.history.as_slice(),
+                Some(&self.tools),
+                ToolPolicy::Required,
+                &mut |token| on_token(turn, token),
+            )
             .await?;
 
-        // content非空, tool_calls非空 -> content = thought
-        // content非空, tool_calls为空 -> content = answer
+        // required 下服务端保证有 tool_calls：content 只能是 thought。
+        // 「有 content、无 tool_calls」是端点无视强制的降级信号，由 run_turn 处理。
         if !reply.content.is_empty() && !reply.tool_calls.is_empty() {
             on_step(&Step::Thought {
                 turn,
@@ -218,33 +296,157 @@ impl ReactLoop {
     async fn finalize(
         &mut self,
         context: &mut ExecuteContext,
+        on_step: &mut impl FnMut(&Step),
         on_token: &mut (impl FnMut(usize, &str) + Send),
     ) -> anyhow::Result<String> {
-        self.history
-            .user("请基于以上信息给出最终回答，不要再调用任何工具。")?;
+        // 用 system 指令而不是 user 消息收尾：这是对「本轮该如何作答」的运行期约束，
+        // 与初始 system prompt 同类，也避免被后续 user/assistant 轮次稀释。
+        self.history.system(FINALIZE_INSTRUCTION)?;
 
         let turn = self.max_turns + 1;
         context.set_turn(turn);
 
+        // 动态裁剪工具面到只剩 final_answer：即使端点忽略了具名强制，模型也没有
+        // 旁路工具可调，只能交付答案（同时省掉一整车无关的 function 定义）。
+        let tools = finalize_tools(&self.tools);
+
         let reply = self
             .completer
-            .stream(self.history.as_slice(), None, &mut |token| {
-                on_token(turn, token)
-            })
+            .stream(
+                self.history.as_slice(),
+                tools.as_ref(),
+                ToolPolicy::Force(FINAL_ANSWER_TOOL.to_owned()),
+                &mut |token| on_token(turn, token),
+            )
             .await?;
-        let answer = reply.content;
 
-        if answer.trim().is_empty() {
-            anyhow::bail!("收尾轮返回了空内容");
+        // 与 run_turn 一致：只把能配对的 function 调用落库；并行开启后收尾轮
+        // 同样可能一次带回多个 call。
+        let calls = function_calls(&reply.tool_calls);
+
+        // 注意这里要的是「原始调用」而非 `find_final_answer`：收尾轮没有下一轮
+        // 重试，参数非法也必须照样补配对消息，所以不能复用那条会过滤非法参数的判据。
+        let delivered = final_answer_call(&calls);
+
+        // 收尾轮没有下一轮可以重试，任何拿不到合法 final_answer 的情形都必须软着陆，
+        // 否则整个 run 会报错，把此前所有工具结果一起丢掉。
+        let answer = match delivered {
+            Some(func) => match final_answer::extract_answer(&func.function.arguments) {
+                Ok(answer) => answer,
+                Err(error) => {
+                    tracing::warn!(%error, "收尾轮 final_answer 参数非法，退回 content/兜底文案");
+                    best_effort_answer(&reply.content)
+                }
+            },
+            None => {
+                tracing::warn!("端点无视 tool_choice 具名强制，收尾轮退回 content/兜底文案");
+                best_effort_answer(&reply.content)
+            }
+        };
+
+        // 先落助手消息，再补齐每个 call 的配对 tool 消息，保证历史结构合法。
+        self.history.assistant(&reply.content, calls.clone())?;
+        if let Some(func) = delivered {
+            self.pair_delivery(context, &calls, func, &answer)?;
         }
+
         context.push_event(Event::new(
             EventName::Answer,
             answer.clone(),
             Role::Assistant,
         ));
-        self.history.assistant(&answer, Vec::new())?;
+        on_step(&Step::Answer {
+            turn,
+            content: answer.clone(),
+        });
+
         Ok(answer)
     }
+}
+
+/// 兄弟调用在交付路径上的占位回填：它们从未被执行，但每个 `tool_call` 都必须有
+/// 配对的 tool 消息，否则历史结构非法、无法再次发送。
+const SKIPPED_CALL_NOTE: &str = "本轮已由 final_answer 结束，该调用未执行。";
+
+/// 收尾轮追加的 system 指令：既讲清「必须交付」，也允许模型承认信息缺失，
+/// 免得它为了凑一个确定答案而编造。
+const FINALIZE_INSTRUCTION: &str = "你已经达到最大工具调用轮次。请基于当前已收集的全部信息，立即调用 \
+     final_answer 工具给出你能提供的最佳答案。如果信息不足，请在 answer 中明确说明哪些信息缺失。";
+
+/// 收尾轮连 content 都拿不到时的最后兜底：宁可交付一句可读的说明，也不让整个 run
+/// 因收尾失败而报错，丢掉此前所有工具结果。
+const FINALIZE_EMPTY_FALLBACK: &str =
+    "已达到最大工具调用轮次，但模型未能给出最终答案；请基于已有信息重新提问或调整问题。";
+
+/// 过滤出本仓库能执行、能配对的 function 调用。
+///
+/// `Custom` 等变体既没有执行路径，也无法回填 tool 消息——写进历史只会留下无人
+/// 应答的 `tool_call`，所以在这里就丢掉并告警。
+fn function_calls(
+    tool_calls: &[ChatCompletionMessageToolCalls],
+) -> Vec<ChatCompletionMessageToolCalls> {
+    let calls: Vec<_> = tool_calls
+        .iter()
+        .filter(|call| matches!(call, ChatCompletionMessageToolCalls::Function(_)))
+        .cloned()
+        .collect();
+
+    if calls.len() != tool_calls.len() {
+        tracing::warn!(
+            "忽略 {} 个非 function 类型的工具调用（无法执行，也无法回填）",
+            tool_calls.len() - calls.len()
+        );
+    }
+
+    calls
+}
+
+/// 收尾轮的工具面：只留 `final_answer`，让模型没有旁路可走。
+///
+/// 返回 `None` 表示工具表里没有 `final_answer`（违反 [`ReactLoop::new`] 的约定）：
+/// 此时退化成不带工具的请求，由 `finalize` 的兜底分支接管，而不是构造出非法的
+/// 具名 `tool_choice`。
+fn finalize_tools(tools: &ToolHashMap) -> Option<ToolHashMap> {
+    tools
+        .get(FINAL_ANSWER_TOOL)
+        .map(|tool| ToolHashMap::from([(FINAL_ANSWER_TOOL.to_owned(), tool.clone())]))
+}
+
+/// 收尾轮拿不到合法 `final_answer` 时的软着陆：有 content 就用 content，没有就交付
+/// 固定文案。绝不返回 `Err`——收尾轮失败会把整个 run 的已收集信息一起丢掉。
+fn best_effort_answer(content: &str) -> String {
+    if content.trim().is_empty() {
+        FINALIZE_EMPTY_FALLBACK.to_owned()
+    } else {
+        content.to_owned()
+    }
+}
+
+/// 按名字找出本轮里的 `final_answer` 调用（不校验参数）。
+///
+/// `run_turn` 与 `finalize` 都需要「本轮有没有 final_answer」这一判断，区别只在
+/// 参数非法怎么办：循环内压成 Observation 重试，收尾轮必须照样配对消息。把纯匹配
+/// 抽出来共用，免得两边各写一份 `match`。
+fn final_answer_call(
+    calls: &[ChatCompletionMessageToolCalls],
+) -> Option<&ChatCompletionMessageToolCall> {
+    calls.iter().find_map(|call| match call {
+        ChatCompletionMessageToolCalls::Function(func)
+            if func.function.name == FINAL_ANSWER_TOOL =>
+        {
+            Some(func)
+        }
+        _ => None,
+    })
+}
+
+/// 找出本轮里参数合法的 `final_answer`：交付与否只看它，与遍历顺序无关。
+fn find_final_answer(
+    calls: &[ChatCompletionMessageToolCalls],
+) -> Option<(&ChatCompletionMessageToolCall, String)> {
+    let func = final_answer_call(calls)?;
+    let answer = final_answer::extract_answer(&func.function.arguments).ok()?;
+    Some((func, answer))
 }
 
 fn answer(
@@ -252,6 +454,7 @@ fn answer(
     turn: usize,
     context: &mut ExecuteContext,
     on_step: &mut impl FnMut(&Step),
+    termination: Termination,
 ) -> Option<Outcome> {
     on_step(&Step::Answer {
         turn,
@@ -265,7 +468,7 @@ fn answer(
     Some(Outcome {
         answer: content,
         turns: turn,
-        termination: Termination::ModelFinished,
+        termination,
     })
 }
 
@@ -286,27 +489,32 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use async_openai::types::chat::{ChatCompletionMessageToolCall, FunctionCall};
+    use async_openai::types::chat::{
+        ChatCompletionMessageToolCall, ChatCompletionRequestToolMessageContent, FunctionCall,
+    };
     use serde_json::{Value, json};
 
-    use crate::agent::llm::models::Reply;
+    use crate::agent::llm::models::{Reply, ToolPolicy};
     use crate::agent::react::models::DEFAULT_MAX_TURNS;
+    use crate::tools::local::final_answer::{FINAL_ANSWER_TOOL, FinalAnswer};
     use crate::tools::tool::Tool;
 
-    fn answer(text: &str) -> Reply {
+    /// 纯文本回复：在 required 语义下这是「端点无视 tool_choice」的降级输入。
+    fn text_reply(text: &str) -> Reply {
         Reply {
             content: text.to_owned(),
             tool_calls: Vec::new(),
         }
     }
 
-    fn call(name: &str, arguments: &str) -> Reply {
+    fn call_id(id: &str, name: &str, arguments: &str) -> Reply {
         Reply {
             content: String::new(),
             tool_calls: vec![ChatCompletionMessageToolCalls::Function(
                 ChatCompletionMessageToolCall {
-                    id: "call_1".to_owned(),
+                    id: id.to_owned(),
                     function: FunctionCall {
                         name: name.to_owned(),
                         arguments: arguments.to_owned(),
@@ -316,12 +524,38 @@ mod tests {
         }
     }
 
+    fn call(name: &str, arguments: &str) -> Reply {
+        call_id("call_1", name, arguments)
+    }
+
+    fn multi_call(calls: Vec<(&str, &str, &str)>) -> Reply {
+        Reply {
+            content: String::new(),
+            tool_calls: calls
+                .into_iter()
+                .map(|(id, name, arguments)| {
+                    ChatCompletionMessageToolCalls::Function(ChatCompletionMessageToolCall {
+                        id: id.to_owned(),
+                        function: FunctionCall {
+                            name: name.to_owned(),
+                            arguments: arguments.to_owned(),
+                        },
+                    })
+                })
+                .collect(),
+        }
+    }
+
     fn calls_echo(arguments: &str) -> Reply {
         call("echo", arguments)
     }
 
     fn calls_unknown() -> Reply {
         call("nope", "{}")
+    }
+
+    fn calls_final_answer(text: &str) -> Reply {
+        call(FINAL_ANSWER_TOOL, &json!({ "answer": text }).to_string())
     }
 
     fn thinking_call(content: &str, name: &str, arguments: &str) -> Reply {
@@ -345,19 +579,34 @@ mod tests {
 
     struct ScriptedCompleter {
         replies: Mutex<Vec<Reply>>,
+        policies: Mutex<Vec<ToolPolicy>>,
+        /// 每次请求实际暴露的工具名（排序后），用来断言收尾轮的裁剪。
+        tool_names: Mutex<Vec<Vec<String>>>,
     }
 
     impl ScriptedCompleter {
         fn new(replies: Vec<Reply>) -> Arc<Self> {
             Arc::new(Self {
                 replies: Mutex::new(replies),
+                policies: Mutex::new(Vec::new()),
+                tool_names: Mutex::new(Vec::new()),
             })
         }
 
         fn next(
             &self,
+            tools: Option<&ToolHashMap>,
+            policy: &ToolPolicy,
             on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
         ) -> anyhow::Result<Reply> {
+            self.policies.lock().expect("锁被毒化").push(policy.clone());
+
+            let mut names: Vec<String> = tools
+                .map(|tools| tools.keys().cloned().collect())
+                .unwrap_or_default();
+            names.sort();
+            self.tool_names.lock().expect("锁被毒化").push(names);
+
             let mut replies = self.replies.lock().expect("锁被毒化");
             if replies.is_empty() {
                 anyhow::bail!("预置响应已用尽");
@@ -368,6 +617,14 @@ mod tests {
             }
             Ok(reply)
         }
+
+        fn policies(&self) -> Vec<ToolPolicy> {
+            self.policies.lock().expect("锁被毒化").clone()
+        }
+
+        fn tool_names(&self) -> Vec<Vec<String>> {
+            self.tool_names.lock().expect("锁被毒化").clone()
+        }
     }
 
     #[async_trait::async_trait]
@@ -375,22 +632,36 @@ mod tests {
         async fn complete(
             &self,
             _messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
+            tools: Option<&ToolHashMap>,
+            policy: ToolPolicy,
         ) -> anyhow::Result<Reply> {
-            self.next(&mut |_| {})
+            self.next(tools, &policy, &mut |_| {})
         }
 
         async fn stream(
             &self,
             _messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
+            tools: Option<&ToolHashMap>,
+            policy: ToolPolicy,
             on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
         ) -> anyhow::Result<Reply> {
-            self.next(on_token)
+            self.next(tools, &policy, on_token)
         }
     }
 
-    struct EchoTool;
+    /// 执行次数探针：用来断言「不该执行」的调用确实没有执行。
+    #[derive(Default)]
+    struct EchoProbe(AtomicUsize);
+
+    impl EchoProbe {
+        fn count(&self) -> usize {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    struct EchoTool {
+        executed: Arc<EchoProbe>,
+    }
 
     #[async_trait::async_trait]
     impl Tool for EchoTool {
@@ -407,6 +678,7 @@ mod tests {
         }
 
         async fn execute(&self, args_json: &str) -> anyhow::Result<String> {
+            self.executed.0.fetch_add(1, Ordering::Relaxed);
             if args_json.contains("boom") {
                 anyhow::bail!("工具内部炸了");
             }
@@ -415,13 +687,34 @@ mod tests {
     }
 
     fn build(completer: Arc<dyn Completer>) -> ReactLoop {
-        build_with_max_turns(completer, DEFAULT_MAX_TURNS)
+        build_with_probe(completer, DEFAULT_MAX_TURNS).0
     }
 
     fn build_with_max_turns(completer: Arc<dyn Completer>, max_turns: usize) -> ReactLoop {
+        build_with_probe(completer, max_turns).0
+    }
+
+    /// 与 [`build`] 相同，但额外返回 echo 的执行次数探针。
+    fn build_with_probe(
+        completer: Arc<dyn Completer>,
+        max_turns: usize,
+    ) -> (ReactLoop, Arc<EchoProbe>) {
+        let executed = Arc::new(EchoProbe::default());
         let mut tools = ToolHashMap::new();
-        tools.insert("echo".to_owned(), Arc::new(EchoTool) as Arc<dyn Tool>);
-        ReactLoop::new(completer, tools, "你是测试助手。", max_turns).expect("构造 ReactLoop 失败")
+        tools.insert(
+            "echo".to_owned(),
+            Arc::new(EchoTool {
+                executed: executed.clone(),
+            }) as Arc<dyn Tool>,
+        );
+        // 手工拼表同样要显式注册 final_answer：收尾轮会以 tool_choice 具名强制它。
+        tools.insert(
+            FINAL_ANSWER_TOOL.to_owned(),
+            Arc::new(FinalAnswer) as Arc<dyn Tool>,
+        );
+        let agent = ReactLoop::new(completer, tools, "你是测试助手。", max_turns)
+            .expect("构造 ReactLoop 失败");
+        (agent, executed)
     }
 
     fn tool_messages(agent: &ReactLoop) -> usize {
@@ -433,8 +726,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn answers_directly_without_tools() {
-        let mut agent = build(ScriptedCompleter::new(vec![answer("答案是 42")]));
+    async fn final_answer_terminates_with_its_argument() {
+        // final_answer 不被执行：参数即答案（`extract_answer` 与 `execute` 同源，
+        // 所以这里断言的值与旧的 execute 返回值一致）。
+        let mut agent = build(ScriptedCompleter::new(vec![calls_final_answer("42")]));
+
+        let outcome = agent
+            .run("问题", |_| {}, |_, _| {})
+            .await
+            .expect("应当成功");
+
+        assert_eq!(outcome.answer, "42");
+        assert_eq!(outcome.turns, 1);
+        assert_eq!(outcome.termination, Termination::FinalAnswer);
+        assert_eq!(
+            tool_messages(&agent),
+            1,
+            "交付也必须留下配对 tool 消息，历史才可重放"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_only_reply_degrades_to_answer() {
+        // required 下服务端必须给 tool_call；纯文本说明端点无视了 tool_choice。
+        let completer = ScriptedCompleter::new(vec![text_reply("答案是 42")]);
+        let mut agent = build(completer.clone());
 
         let outcome = agent
             .run("问题", |_| {}, |_, _| {})
@@ -444,13 +760,18 @@ mod tests {
         assert_eq!(outcome.answer, "答案是 42");
         assert_eq!(outcome.turns, 1);
         assert_eq!(outcome.termination, Termination::ModelFinished);
+        assert_eq!(
+            completer.policies(),
+            vec![ToolPolicy::Required],
+            "循环内一律 required"
+        );
     }
 
     #[tokio::test]
     async fn executes_tool_then_answers() {
         let mut agent = build(ScriptedCompleter::new(vec![
             calls_echo(r#"{"q":"hi"}"#),
-            answer("工具结果如上"),
+            calls_final_answer("工具结果如上"),
         ]));
 
         let outcome = agent
@@ -460,10 +781,11 @@ mod tests {
 
         assert_eq!(outcome.turns, 2);
         assert_eq!(outcome.answer, "工具结果如上");
+        assert_eq!(outcome.termination, Termination::FinalAnswer);
         assert_eq!(
             tool_messages(&agent),
-            1,
-            "每个 tool_call 都要有配对的 tool 消息"
+            2,
+            "echo 与 final_answer 各有一条配对 tool 消息"
         );
     }
 
@@ -471,7 +793,7 @@ mod tests {
     async fn tool_failure_becomes_observation() {
         let mut agent = build(ScriptedCompleter::new(vec![
             calls_echo(r#"{"q":"boom"}"#),
-            answer("工具失败了"),
+            calls_final_answer("工具失败了"),
         ]));
 
         let outcome = agent
@@ -479,15 +801,15 @@ mod tests {
             .await
             .expect("工具失败不应中断循环");
 
-        assert_eq!(outcome.termination, Termination::ModelFinished);
-        assert_eq!(tool_messages(&agent), 1, "失败的调用同样要回填 tool 消息");
+        assert_eq!(outcome.termination, Termination::FinalAnswer);
+        assert_eq!(tool_messages(&agent), 2, "失败的调用同样要回填 tool 消息");
     }
 
     #[tokio::test]
     async fn unknown_tool_becomes_observation() {
         let mut agent = build(ScriptedCompleter::new(vec![
             calls_unknown(),
-            answer("没有这个工具"),
+            calls_final_answer("没有这个工具"),
         ]));
 
         let outcome = agent
@@ -495,36 +817,250 @@ mod tests {
             .await
             .expect("未知工具不应中断循环");
 
-        assert_eq!(outcome.termination, Termination::ModelFinished);
-        assert_eq!(tool_messages(&agent), 1);
+        assert_eq!(outcome.termination, Termination::FinalAnswer);
+        assert_eq!(tool_messages(&agent), 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_final_answer_becomes_observation_and_retries() {
+        let mut agent = build(ScriptedCompleter::new(vec![
+            call(FINAL_ANSWER_TOOL, "not json"),
+            calls_final_answer("补上的答案"),
+        ]));
+
+        let observed = RefCell::new(Vec::new());
+        let outcome = agent
+            .run(
+                "问题",
+                |step| observed.borrow_mut().push(step.clone()),
+                |_, _| {},
+            )
+            .await
+            .expect("参数非法不应中断循环");
+
+        assert_eq!(outcome.turns, 2, "第一轮不该被当成终止");
+        assert_eq!(outcome.termination, Termination::FinalAnswer);
+        assert_eq!(outcome.answer, "补上的答案");
+        assert!(
+            observed.borrow().iter().any(|step| matches!(
+                step,
+                Step::Observation { name, output, .. }
+                    if name == FINAL_ANSWER_TOOL && output.contains("工具执行失败")
+            )),
+            "参数错误必须压成 Observation，实际轨迹：{:?}",
+            trace(&observed)
+        );
+    }
+
+    #[tokio::test]
+    async fn final_answer_alongside_other_calls_still_pairs_every_tool_message() {
+        let completer = ScriptedCompleter::new(vec![multi_call(vec![
+            ("call_1", "echo", r#"{"q":"hi"}"#),
+            (
+                "call_2",
+                FINAL_ANSWER_TOOL,
+                r#"{"answer":"并存时以 final_answer 为准"}"#,
+            ),
+        ])]);
+        let (mut agent, executed) = build_with_probe(completer, DEFAULT_MAX_TURNS);
+
+        let observed = RefCell::new(Vec::new());
+        let outcome = agent
+            .run(
+                "问题",
+                |step| observed.borrow_mut().push(step.clone()),
+                |_, _| {},
+            )
+            .await
+            .expect("应当成功");
+
+        assert_eq!(outcome.termination, Termination::FinalAnswer);
+        assert_eq!(outcome.answer, "并存时以 final_answer 为准");
+        assert_eq!(executed.count(), 0, "答案已定，同轮其它调用一律不执行");
+        assert_eq!(tool_messages(&agent), 2, "两个 call 都要有配对 tool 消息");
+        assert_eq!(
+            trace(&observed),
+            vec![(1, "answer")],
+            "交付不是工具回合：不执行、不发 Action/Observation"
+        );
+
+        let tool_texts: Vec<String> = agent
+            .history()
+            .iter()
+            .filter_map(|m| match m {
+                ChatCompletionRequestMessage::Tool(tool) => match &tool.content {
+                    ChatCompletionRequestToolMessageContent::Text(text) => Some(text.clone()),
+                    ChatCompletionRequestToolMessageContent::Array(_) => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_texts,
+            vec![
+                SKIPPED_CALL_NOTE.to_owned(),
+                "并存时以 final_answer 为准".to_owned()
+            ],
+            "被跳过的调用回填占位文本，交付的那条回填答案"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_final_answer_among_siblings_does_not_terminate() {
+        // 参数非法 → 本轮不算交付：兄弟调用照常执行并配对，让模型下一轮重试。
+        let completer = ScriptedCompleter::new(vec![
+            multi_call(vec![
+                ("call_1", "echo", r#"{"q":"hi"}"#),
+                ("call_2", FINAL_ANSWER_TOOL, "not json"),
+            ]),
+            calls_final_answer("补上的答案"),
+        ]);
+        let (mut agent, executed) = build_with_probe(completer, DEFAULT_MAX_TURNS);
+
+        let outcome = agent
+            .run("问题", |_| {}, |_, _| {})
+            .await
+            .expect("参数非法不应中断循环");
+
+        assert_eq!(outcome.turns, 2, "第一轮不该被当成终止");
+        assert_eq!(outcome.termination, Termination::FinalAnswer);
+        assert_eq!(outcome.answer, "补上的答案");
+        assert_eq!(executed.count(), 1, "本轮仍有真实调用，应照常执行");
+        assert_eq!(
+            tool_messages(&agent),
+            3,
+            "第一轮两个 call 各一条 + 交付轮一条，历史全程可重放"
+        );
     }
 
     #[tokio::test]
     async fn max_turns_still_produces_an_answer() {
-        let mut agent = build_with_max_turns(
-            ScriptedCompleter::new(vec![
-                calls_echo(r#"{"q":"1"}"#),
-                calls_echo(r#"{"q":"2"}"#),
-                answer("被迫收尾的答案"),
-            ]),
-            2,
-        );
+        let completer = ScriptedCompleter::new(vec![
+            calls_echo(r#"{"q":"1"}"#),
+            calls_echo(r#"{"q":"2"}"#),
+            calls_final_answer("被迫收尾的答案"),
+        ]);
+        let mut agent = build_with_max_turns(completer.clone(), 2);
 
+        let observed = RefCell::new(Vec::new());
         let outcome = agent
-            .run("一直用工具", |_| {}, |_, _| {})
+            .run(
+                "一直用工具",
+                |step| observed.borrow_mut().push(step.clone()),
+                |_, _| {},
+            )
             .await
             .expect("撞上限也应拿到答案");
 
         assert_eq!(outcome.termination, Termination::MaxTurns);
         assert_eq!(outcome.turns, 2);
         assert_eq!(outcome.answer, "被迫收尾的答案");
+        assert_eq!(
+            tool_messages(&agent),
+            3,
+            "两轮 echo + 收尾轮的 final_answer"
+        );
+        assert_eq!(
+            completer.policies(),
+            vec![
+                ToolPolicy::Required,
+                ToolPolicy::Required,
+                ToolPolicy::Force(FINAL_ANSWER_TOOL.to_owned()),
+            ],
+            "循环内 required，收尾轮具名强制 final_answer"
+        );
+        assert!(
+            observed.borrow().iter().any(|step| matches!(
+                step,
+                Step::Answer { content, .. } if content == "被迫收尾的答案"
+            )),
+            "收尾轮也必须发 Step::Answer，实际轨迹：{:?}",
+            trace(&observed)
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_turn_only_exposes_final_answer() {
+        let completer = ScriptedCompleter::new(vec![
+            calls_echo(r#"{"q":"1"}"#),
+            calls_final_answer("裁剪后的答案"),
+        ]);
+        let mut agent = build_with_max_turns(completer.clone(), 1);
+
+        let outcome = agent
+            .run("问题", |_| {}, |_, _| {})
+            .await
+            .expect("应当成功");
+
+        assert_eq!(outcome.answer, "裁剪后的答案");
+        assert_eq!(
+            completer.tool_names(),
+            vec![
+                vec!["echo".to_owned(), FINAL_ANSWER_TOOL.to_owned()],
+                vec![FINAL_ANSWER_TOOL.to_owned()],
+            ],
+            "收尾轮只应暴露 final_answer，其它工具不再给模型留旁路"
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_falls_back_to_content_when_force_is_ignored() {
+        let completer = ScriptedCompleter::new(vec![
+            calls_echo(r#"{"q":"1"}"#),
+            text_reply("收尾轮只能说这些"),
+        ]);
+        let mut agent = build_with_max_turns(completer, 1);
+
+        let outcome = agent
+            .run("问题", |_| {}, |_, _| {})
+            .await
+            .expect("端点忽略强制也应软着陆");
+
+        assert_eq!(outcome.termination, Termination::MaxTurns);
+        assert_eq!(outcome.answer, "收尾轮只能说这些");
+    }
+
+    #[tokio::test]
+    async fn finalize_with_empty_reply_still_delivers_a_message() {
+        let completer = ScriptedCompleter::new(vec![calls_echo(r#"{"q":"1"}"#), Reply::default()]);
+        let mut agent = build_with_max_turns(completer, 1);
+
+        let outcome = agent
+            .run("问题", |_| {}, |_, _| {})
+            .await
+            .expect("收尾轮空响应不应让整个 run 报错");
+
+        assert_eq!(outcome.termination, Termination::MaxTurns);
+        assert_eq!(outcome.answer, FINALIZE_EMPTY_FALLBACK);
+    }
+
+    #[tokio::test]
+    async fn finalize_with_invalid_answer_degrades_instead_of_failing() {
+        let completer = ScriptedCompleter::new(vec![
+            calls_echo(r#"{"q":"1"}"#),
+            call(FINAL_ANSWER_TOOL, "not json"),
+        ]);
+        let mut agent = build_with_max_turns(completer, 1);
+
+        let outcome = agent
+            .run("问题", |_| {}, |_, _| {})
+            .await
+            .expect("收尾轮参数非法也应软着陆");
+
+        assert_eq!(outcome.termination, Termination::MaxTurns);
+        assert_eq!(outcome.answer, FINALIZE_EMPTY_FALLBACK);
+        assert_eq!(
+            tool_messages(&agent),
+            2,
+            "echo 与非法 final_answer 都要配对"
+        );
     }
 
     #[tokio::test]
     async fn final_turn_is_an_answer_not_a_thought() {
         let mut agent = build(ScriptedCompleter::new(vec![
             calls_echo(r#"{"q":"hi"}"#),
-            answer("最终答案"),
+            calls_final_answer("最终答案"),
         ]));
 
         let observed = RefCell::new(Vec::new());
@@ -540,8 +1076,8 @@ mod tests {
         assert_eq!(outcome.answer, "最终答案");
         assert_eq!(
             trace(&observed),
-            vec![(1, "action"), (1, "observation"), (2, "answer"),],
-            "收尾轮的 content 必须发 Answer，不能走 Thought"
+            vec![(1, "action"), (1, "observation"), (2, "answer")],
+            "交付轮只有 Answer：不执行工具，因此没有 action/observation"
         );
     }
 
@@ -549,7 +1085,7 @@ mod tests {
     async fn intermediate_turn_with_content_is_a_thought() {
         let mut agent = build(ScriptedCompleter::new(vec![
             thinking_call("我先查一下", "echo", r#"{"q":"hi"}"#),
-            answer("答案"),
+            calls_final_answer("答案"),
         ]));
 
         let observed = RefCell::new(Vec::new());
@@ -607,5 +1143,11 @@ mod tests {
         assert!(failed.contains("工具执行失败"));
 
         assert_eq!(agent.execute("nope", "{}").await, "未知工具：nope");
+        assert_eq!(
+            agent
+                .execute(FINAL_ANSWER_TOOL, r#"{"answer":"输入即输出"}"#)
+                .await,
+            "输入即输出"
+        );
     }
 }

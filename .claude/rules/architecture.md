@@ -59,9 +59,9 @@ Prompt must contain the word 'json' in some form to use 'response_format' of typ
 
 给流式加重试前必读：失败重试会重跑整个 stream，而上一轮已经 `print!` 出去的内容不会回滚，用户会看到重复输出。目前 `Completer::stream` **不写任何历史**（传输层已完全无状态），所以不存在「同一条回复进历史两次」的问题——但**给流式加副作用时（落库、追加消息）要重新考虑这件事**。
 
-## 5. ReAct 循环的三条不变量
+## 5. ReAct 循环的四条不变量
 
-`src/agent/react/runner.rs` 的 `ReactLoop::run` 是全仓库唯一实现「请求 → 工具调用 → 回填 → 再请求」的地方（`LLMClient` 曾经有过一份自己的闭环，已随 `chat()` 一起删除）。三条不变量都是**违反时不报错、只在运行期静默出错**的：
+`src/agent/react/runner.rs` 的 `ReactLoop::run` 是全仓库唯一实现「请求 → 工具调用 → 回填 → 再请求」的地方（`LLMClient` 曾经有过一份自己的闭环，已随 `chat()` 一起删除）。四条不变量都是**违反时不报错、只在运行期静默出错**的：
 
 **① `execute` 返回 `String`，不返回 `Result<String>`。**
 
@@ -77,13 +77,19 @@ async fn execute(&self, name: &str, arguments: &str) -> String
 
 **③ 撞轮次上限走软收尾，不 `bail!`。**
 
-`run()` 的 for 循环跑满后调用 `finalize()`：去掉 `tools` 再问一轮，明确要求「不要再调用任何工具」。直接报错会把整轮探索的成果扔掉。`finalize` 只有在收尾轮返回空内容时才报错。
+`run()` 的 for 循环跑满后调用 `finalize()`：把工具面裁到只剩 `final_answer`、追加一条 system 指令，再用 `tool_choice={"type":"function","function":{"name":"final_answer"}}` 强制一轮，答案从工具参数里取。直接报错会把整轮探索的成果扔掉，所以 `finalize` **不 `bail!`**：参数非法、端点忽略具名强制、甚至 `content` 也空，一律按「`content` → 固定兜底文案」软着陆，并照常发出 `Step::Answer`。
 
-其余细节：`ReactLoop::new` 目前直接按 `ToolHashMap` 的迭代顺序收集工具定义（`HashMap` 顺序不保证，跨进程/跨运行可能不同，请求内容因此**不是严格可复现的**——要复现需在 `new` 里按名字排序后再 `map(definition)`）；`Thought`（`content`）和 `Action`（`tool_calls`）**一起**写进历史，丢掉 `content` 就丢了 ReAct 里的思考环节；模型返回空回复（content 与 tool_calls 都为空）时直接以 `Termination::EmptyReply` 收束，不再 nudge 并继续。
+**④ `final_answer` 是普通可执行工具，不是 `execute` 之前的特殊分支。**
 
-**`Step::Thought` 与 `Step::Answer` 互斥，判据是 `calls.is_empty()`，两者都必须在那个判断之后发射。** `Thought` 曾经写在判断之前，结果是**收尾轮的最终答案被错标成 Thinking**——任何「思考画暗、答案画亮」的渲染都会画错。这条由 `final_turn_is_an_answer_not_a_thought` 与 `intermediate_turn_with_content_is_a_thought` 两个测试按轮次钉住。
+`src/tools/local/final_answer/mod.rs` 的 `execute` **输入即输出**：解析 `answer` 参数后原样返回。于是循环用统一的 `action → execute → Observation` 路径就能拿到最终答案，每个 `tool_call` 也天然有配对 tool 消息（不变量②）。循环的终止判据是「参数可解析」（`extract_answer`），交付值取 `execute` 的返回值——两者同源、必然一致。**若改成「在 `execute` 之前拦截、跳过执行」，同轮其它 `tool_call` 就会失去配对 tool 消息。** `extract_answer` / `execute` 必须是纯函数：给这个工具加副作用会破坏「可安全重复调用」这条隐含约定。
 
-**已知不对称**：撞上限时走的 `finalize()` 在 turn 循环之外，只发 token 不发 `Step::Answer`。所以「收到 `Answer`」只覆盖 `ModelFinished` 那条终止路径。
+**循环内每轮都是 `tool_choice=required`。** 服务端保证回复里至少有一个 `tool_call`，所以模型**只能**靠 `final_answer` 结束，`content` 永远只是 thought。两条降级路径兜底：(a) 回复里没有 `tool_calls` → 端点无视了强制，把 `content` 当答案收尾（`Termination::ModelFinished`）；(b) 端点以 400 明确拒绝 `tool_choice` → `LLMClient` 置粘性标记（`AtomicBool`）、改用 `Auto` 重发一次，此后所有请求都不再强制。`ToolPolicy`（`Auto` / `Required` / `Force(name)`）是请求级参数，随每轮传入 `Completer`，不能写进 messages。
+
+其余细节：`ReactLoop::new` 目前直接按 `ToolHashMap` 的迭代顺序收集工具定义（`HashMap` 顺序不保证，跨进程/跨运行可能不同，请求内容因此**不是严格可复现的**——要复现需在 `new` 里按名字排序后再 `map(definition)`）；`Thought`（`content`）和 `Action`（`tool_calls`）**一起**写进历史，丢掉 `content` 就丢了 ReAct 里的思考环节；模型返回空回复（content 与 tool_calls 都为空）时直接以 `Termination::EmptyReply` 收束，不再 nudge 并继续。`final_answer` 的注册责任在**工具表构建方**：`build_tools*` 经 `local_tools()` 注册它；`ReactLoop::new` **不做兜底注入**，手工拼表的调用方必须自行插入，否则收尾轮的具名 `tool_choice` 会指向一个未声明的函数、被服务端拒绝。
+
+**`Step::Thought` 与 `Step::Answer` 互斥，判据是 `calls.is_empty()`，两者都必须在那个判断之后发射。** `Thought` 曾经写在判断之前，结果是**收尾轮的最终答案被错标成 Thinking**——任何「思考画暗、答案画亮」的渲染都会画错。这条由 `final_turn_is_an_answer_not_a_thought` 与 `intermediate_turn_with_content_is_a_thought` 两个测试按轮次钉住。注意 `final_answer` 走的是交付路径：只发 `Step::Answer`，不执行、不发 `Step::Action`/`Observation`。
+
+**`finalize()` 现在也发 `Step::Answer`。** 它曾经在 turn 循环之外、只发 token 不发 `Step`，导致只用 `on_step` 的消费方（如 `examples/react_chat`）在撞上限时看不到答案；`final_answer` 落地后收尾轮与正常轮走同一套收尾逻辑，这条不对称已消除。
 
 **`on_token` 的签名是 `FnMut(turn, &str)`——轮次号随 token 一起给。** 理由是「这一轮开始了」没有独立信号：所有 `Step` 都在请求**返回之后**才发，而轮次前缀必须赶在第一个 token **之前**打出来。消费方按「turn 变了就补前缀」惰性处理，就不会给没有 content 的轮次（模型直接发 tool_calls）留下悬空前缀。收尾轮的 token 标 `max_turns + 1`——那是它真实的请求序号，而 `Outcome.turns` 报的是 `max_turns`，两者差 1 是已知的计数口径问题。
 

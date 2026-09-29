@@ -12,7 +12,8 @@ src/
 ├── tools/
 │   ├── tool.rs       # Tool trait
 │   ├── local/        # 本地（进程内）工具，每个工具一个子目录
-│   │   └── web_search/
+│   │   ├── web_search/
+│   │   └── final_answer/
 │   └── mcp/          # MCP 支持（远端工具）
 │       ├── config.rs     # mcp.json 解析与校验
 │       ├── connection.rs # 启动子进程、握手、工具发现
@@ -77,6 +78,23 @@ server 名（即 `mcpServers` 的键）只能包含字母、数字、下划线�
 | 工具级错误（`isError=true`） | 作为正常观察文本回给模型，让其自行纠错 |
 
 日志统一使用 `target = "mcp"`，便于过滤。
+
+## ReAct 循环：强制工具调用与 `final_answer`
+
+循环内每一轮都以 `tool_choice=required` 发请求，并显式打开 `parallel_tool_calls`。后者只是**请求**而不是契约：端点可以忽略它（DeepSeek 的参数表里没有这个字段），所以一轮多个 `tool_call` 会被当作正常输入处理。
+
+最终答案被抽象成一个普通工具 `final_answer`（注册在本地工具表里）。它是「交付」而不是真正的工具：参数即答案，`extract_answer` 输入即输出，**不执行、不发 Observation**。模型**只能**通过调用它来结束任务；在 `required` 语义下 `content` 只是思考。
+
+| 情况 | 行为 |
+|---|---|
+| 模型调用 `final_answer`（参数合法） | 立即交付（`Termination::FinalAnswer`）。同轮其它调用**一律不执行**，但都会补一条配对 tool 消息（被跳过的回填占位文本），历史因此始终可重放 |
+| `final_answer` 参数非法 | 不交付：压成 Observation 让模型重试；同轮其它调用照常执行并配对 |
+| 一轮里 `final_answer` 与其它工具并存 | 交付优先且顺序无关（`find_final_answer`），其余调用不执行 |
+| 非 function 类型的调用（如 `Custom`） | 无法执行也无法回填，落库前丢弃并告警 |
+| 撞轮次上限 | 收尾轮先把工具面裁到只剩 `final_answer`、追加一条 system 指令，再用 `tool_choice` 具名强制它，并发出 `Step::Answer`（不执行、不发 Action/Observation）。拿不到合法参数时退回 `content`，仍为空则交付固定兜底文案，**不报错** |
+| 端点无视 `required`、只回纯文本 | 打告警并按纯文本答案收尾，不中断 |
+| 端点 400 拒绝 `tool_choice` | 打告警，后续请求降级为 `auto` 重发一次 |
+| 未声明任何工具（如 `stream_chat`） | 请求体不带 `tool_choice` |
 
 ## 运行
 
