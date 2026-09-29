@@ -79,7 +79,7 @@ async fn execute(&self, name: &str, arguments: &str) -> String
 
 `run()` 的 for 循环跑满后调用 `finalize()`：去掉 `tools` 再问一轮，明确要求「不要再调用任何工具」。直接报错会把整轮探索的成果扔掉。`finalize` 只有在收尾轮返回空内容时才报错。
 
-其余细节：`ReactLoop::new` 目前直接按 `ToolHashMap` 的迭代顺序收集工具定义（`HashMap` 顺序不保证，跨进程/跨运行可能不同，请求内容因此**不是严格可复现的**——要复现需在 `new` 里按名字排序后再 `map(definition)`）；`Thought`（`content`）和 `Action`（`tool_calls`）**一起**写进历史，丢掉 `content` 就丢了 ReAct 里的思考环节；模型返回空回复时会推一条 user 消息继续，不浪费这一轮。
+其余细节：`ReactLoop::new` 目前直接按 `ToolHashMap` 的迭代顺序收集工具定义（`HashMap` 顺序不保证，跨进程/跨运行可能不同，请求内容因此**不是严格可复现的**——要复现需在 `new` 里按名字排序后再 `map(definition)`）；`Thought`（`content`）和 `Action`（`tool_calls`）**一起**写进历史，丢掉 `content` 就丢了 ReAct 里的思考环节；模型返回空回复（content 与 tool_calls 都为空）时直接以 `Termination::EmptyReply` 收束，不再 nudge 并继续。
 
 **`Step::Thought` 与 `Step::Answer` 互斥，判据是 `calls.is_empty()`，两者都必须在那个判断之后发射。** `Thought` 曾经写在判断之前，结果是**收尾轮的最终答案被错标成 Thinking**——任何「思考画暗、答案画亮」的渲染都会画错。这条由 `final_turn_is_an_answer_not_a_thought` 与 `intermediate_turn_with_content_is_a_thought` 两个测试按轮次钉住。
 

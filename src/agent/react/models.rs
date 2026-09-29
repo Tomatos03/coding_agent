@@ -20,10 +20,6 @@ pub enum Step {
         name: String,
         output: String,
     },
-    Nudge {
-        turn: usize,
-        reason: String,
-    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

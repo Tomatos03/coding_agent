@@ -38,7 +38,6 @@ async fn main() -> anyhow::Result<()> {
                 Step::Observation { turn, name, output } => {
                     println!("[{turn}] {name} 返回：{output}");
                 }
-                Step::Nudge { turn, reason } => println!("[{turn}] 重试：{reason}"),
             },
             |_, _| {},
         )

@@ -228,3 +228,75 @@ fn build_response_format() -> Result<ResponseFormat, anyhow::Error> {
     };
     Ok(format_setting)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn payload(is_solvable: bool, reason: &str, answer: &str) -> String {
+        json!({
+            "is_solvable": is_solvable,
+            "unsolvable_reason": reason,
+            "final_answer": answer,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn parses_strict_json() {
+        let output = parse_gaia_output(&payload(true, "", "42")).expect("整段合法 JSON 应解析成功");
+
+        assert!(output.is_solvable);
+        assert_eq!(output.final_answer, "42");
+        assert!(output.unsolvable_reason.is_empty());
+    }
+
+    #[test]
+    fn parses_json_wrapped_in_prose_or_code_fence() {
+        let content = format!(
+            "我先说明一下：\n```json\n{}\n```\n以上。",
+            payload(true, "", "Paris")
+        );
+
+        let output = parse_gaia_output(&content).expect("应按第一个平衡对象提取");
+
+        assert_eq!(output.final_answer, "Paris");
+    }
+
+    #[test]
+    fn braces_inside_string_literals_do_not_break_extraction() {
+        let answer = r#"集合 {1, 2} 与 "引号" 以及 } 都不该影响深度"#;
+        let content = format!("前缀 {}\n后缀", payload(true, "", answer));
+
+        let output = parse_gaia_output(&content).expect("字符串内的花括号不应计入深度");
+
+        assert_eq!(output.final_answer, answer);
+    }
+
+    #[test]
+    fn plain_text_falls_back_to_final_answer() {
+        let output = parse_gaia_output("  Paris  ").expect("无 JSON 时应整段兜底");
+
+        assert!(output.is_solvable);
+        assert_eq!(output.final_answer, "Paris");
+        assert!(output.unsolvable_reason.is_empty());
+    }
+
+    #[test]
+    fn blank_content_is_rejected() {
+        assert!(parse_gaia_output("   \n\t ").is_err());
+        assert!(parse_gaia_output("").is_err());
+    }
+
+    #[test]
+    fn unbalanced_braces_yield_no_object_then_fallback() {
+        let content = r#"答案是 {"is_solvable":true,"unsolvable_reason":"","final_answer":"x""#;
+        assert!(extract_json_object(content).is_none());
+
+        let output = parse_gaia_output(content).expect("无平衡对象时应走纯文本兜底");
+
+        assert!(output.is_solvable);
+        assert_eq!(output.final_answer, content.trim());
+    }
+}

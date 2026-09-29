@@ -339,7 +339,6 @@ mod tests {
                 Step::Answer { turn, .. } => (*turn, "answer"),
                 Step::Action { turn, .. } => (*turn, "action"),
                 Step::Observation { turn, .. } => (*turn, "observation"),
-                Step::Nudge { turn, .. } => (*turn, "nudge"),
             })
             .collect()
     }

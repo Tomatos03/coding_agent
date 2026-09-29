@@ -20,22 +20,23 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 
 ## 测试
 
-**当前 54 个测试**：默认跑 51 个（全部离线，不联网、不需要凭证），另外 3 个是 `#[ignore]` 的 MCP 集成测试（需要本机 `python3`）。
+**当前 60 个测试**：默认跑 57 个（全部离线，不联网、不需要凭证），另外 3 个是 `#[ignore]` 的 MCP 集成测试（需要本机 `python3`）。
 
-`src/agent/react/runner.rs` 8 个，覆盖循环逻辑：
+`src/agent/react/runner.rs` 9 个，覆盖循环逻辑：
 
 - 模型直接给答案 → `turns == 1`，`Termination::ModelFinished`
 - 一轮工具后给答案 → tool 消息按序进了历史
 - 工具执行失败 → 循环没断，错误进了 Observation
 - 未知工具名 → 同上
 - 连续请求工具 → 撞上限，`Termination::MaxTurns`，**仍返回答案**
-- 模型返回空回复 → 推一把后继续
+- 模型返回空回复（content 与 tool_calls 都为空）→ 立即以 `Termination::EmptyReply` 收束，`turns` 为当前轮，历史末尾留下一条空 assistant 消息
+- `execute()` 把工具失败与未知工具名压成观察文案（「工具执行失败：…」/「未知工具：…」）
 - **收尾轮的 content 发 `Step::Answer` 而非 `Thought`** → 断言完整的事件序列 `[(1,action),(1,observation),(2,answer)]`
 - **中间轮的 content 发 `Step::Thought`** → 断言 `[(1,thought),(1,action),(1,observation),(2,answer)]`
 
 后两条用 `trace()` 辅助函数把 `Step` 压成 `(轮次, 类型)` 序列做整体比对——比逐个 `assert!(matches!(...))` 更能钉住**顺序**，而这两条的核心正是发射顺序。
 
-`src/agent/react/context.rs` 2 个：`ExecuteContext` 每次构造拿到唯一 id 且初始 `Running`、`set_status` 的状态流转。
+`src/agent/react/context.rs` 6 个：`ExecuteContext` 每次构造拿到唯一 id 且初始 `Running`、`set_status` 的状态流转、`Event` 记录 name/content/role/timestamp、事件序列化为平铺 JSON（毫秒时间戳）、`set_turn` 只保留当前轮事件、事件保持插入顺序。
 
 `src/agent/llm/models.rs` 3 个，覆盖流式分片重组（`ToolCallAccumulator`）：
 
@@ -50,7 +51,7 @@ MCP 相关共 32 个：
 - `src/tools/mcp/connection.rs` 5 个（1 个 ignored）：`Send + Sync`、空配置、失败隔离、真实 server 工具发现
 - `src/tools/mod.rs` 3 个（1 个 ignored）：重名去重、空配置只含本地工具、连接在注册后仍存活
 
-GAIA 相关 9 个（全部离线）：`src/gaia/solver.rs` 6 个（严格 JSON / 代码块与正文包裹 / 字符串内花括号 / 纯文本兜底 / 空内容报错 / 无平衡对象），`src/gaia/report.rs` 2 个（按模型×模式汇总、通过率边界），`src/gaia/evaluator.rs` 1 个（脚本化 `Completer` 跑通带工具的 ReAct 路径并统计工具调用次数）。
+GAIA 相关 10 个（全部离线）：`src/gaia/solver.rs` 6 个（严格 JSON / 代码块与正文包裹 / 字符串内花括号 / 纯文本兜底 / 空内容报错 / 无平衡对象），`src/gaia/report.rs` 2 个（按模型×模式汇总、通过率边界），`src/gaia/evaluator.rs` 1 个（脚本化 `Completer` 跑通带工具的 ReAct 路径并统计工具调用次数），`src/gaia/models.rs` 1 个（`schemars` 的 `deny_unknown_fields` 只作用于 JSON Schema，serde 侧仍忽略未知字段）。
 
 3 个 `#[ignore]` 都需要 `python3` + `tests/fixtures/fake_mcp_server.py`，跑法：
 
@@ -62,7 +63,7 @@ cargo test --lib -- --ignored
 
 **给新组件补测试时沿用这个模式**：先做一个 trait 接缝，再写假的实现。`Reply` 有 `Default` 且字段是 `String` / `Vec`，构造测试响应不需要任何辅助函数。
 
-`tests/` 目录只放测试支撑资源（目前是 `tests/fixtures/fake_mcp_server.py`），没有 Rust 集成测试目标。`cargo test` 会连带编译 `examples/`，示例写坏了在这里就会暴露。
+`tests/` 目录只放测试支撑资源（目前是 `tests/fixtures/fake_mcp_server.py`），没有 Rust 集成测试目标。`cargo test` **不**编译 `examples/`；要连示例一起校验得用 `cargo test --all-targets`（README 的跑法就是它）。
 
 ## 环境变量
 
@@ -95,4 +96,4 @@ MCP server 配置走**文件** `mcp.json`（位于当前工作目录，当前不
 
 无 `rust-toolchain.toml`，也没接 CI。`edition = "2024"` 需要 rustc ≥ 1.85（实际用到 let-chains 与 `Result::inspect_err`，需要 ≥ 1.88 / 1.76）。
 
-`Cargo.toml` 里的 `async-stream` 与 `uuid` 目前**没有任何调用方**，属于待清理项。
+`Cargo.toml` 里的 `async-stream` 目前**没有任何调用方**，属于待清理项（`uuid` 已被 `src/agent/react/context.rs` 使用）。

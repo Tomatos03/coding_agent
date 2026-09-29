@@ -63,3 +63,18 @@ pub struct GaiaEvalResult {
     pub error: Option<String>,
     pub tool_calls: Option<usize>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_keys_are_ignored_by_serde() {
+        let output: GaiaOutput = serde_json::from_str(
+            r#"{"is_solvable":true,"unsolvable_reason":"","final_answer":"42","extra":"ignored"}"#,
+        )
+        .expect("未知字段不应导致解析失败");
+
+        assert_eq!(output.final_answer, "42");
+    }
+}
