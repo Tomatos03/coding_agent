@@ -12,15 +12,16 @@ cargo run --example tool_exec      # 不走 LLM，直接验证「注册表 → t
 cargo run --example mcp_probe      # 连接 stdio MCP server，打印/调用适配出的工具（默认用测试 fixture）
 cargo run --example mcp_react      # 端到端：用户提问 → ReAct → 调用 MCP（脚本化模型，无需 LLM 凭证）
 cargo run --example mcp_chat       # 真实 LLM + MCP：从 mcp.json 加载工具，模型自主调用（需要凭证与 mcp.json）
+cargo run --example rag_chat       # 端到端检索：ingest 若干文本 → 提问 → 打印 top-k（需 EMBEDDING_* 凭证）
 cargo fmt
 cargo clippy                       # 当前 -- -D warnings 下零告警
 ```
 
-`react_chat`、`stream_chat`、`mcp_chat` 需要 LLM provider 的凭证（`mcp_chat` 还需要 `mcp.json`）；`web_search` 与 `tool_exec` 另外需要 Tavily 的凭证；`mcp_probe` 与 `mcp_react` 用自带假 server 时不需要任何凭证（只需 `python3`）。
+`react_chat`、`stream_chat`、`mcp_chat` 需要 LLM provider 的凭证（`mcp_chat` 还需要 `mcp.json`）；`web_search` 与 `tool_exec` 另外需要 Tavily 的凭证；`mcp_probe` 与 `mcp_react` 用自带假 server 时不需要任何凭证（只需 `python3`）；`rag_chat` 需要 embedding 凭证（`EMBEDDING_*`）。
 
 ## 测试
 
-**当前 80 个测试**：默认跑 77 个（全部离线，不联网、不需要凭证），另外 3 个是 `#[ignore]` 的 MCP 集成测试（需要本机 `python3`）。
+**当前 96 个测试**：默认跑 92 个（全部离线，不联网、不需要凭证），另外 4 个是 `#[ignore]`：3 个 MCP 集成测试（需要本机 `python3`）+ 1 个 embedding 真实端点联测（需要 `EMBEDDING_*` 凭证）。
 
 `src/agent/react/runner.rs` 17 个，覆盖循环逻辑：
 
@@ -61,7 +62,9 @@ MCP 相关共 32 个：
 
 GAIA 相关 11 个（全部离线）：`src/gaia/solver.rs` 6 个（严格 JSON / 代码块与正文包裹 / 字符串内花括号 / 纯文本兜底 / 空内容报错 / 无平衡对象），`src/gaia/report.rs` 2 个（按模型×模式汇总、通过率边界），`src/gaia/evaluator.rs` 2 个（脚本化 `Completer` 跑通带工具的 ReAct 路径并统计工具调用次数；**`final_answer` 不计入工具调用**），`src/gaia/models.rs` 1 个（`schemars` 的 `deny_unknown_fields` 只作用于 JSON Schema，serde 侧仍忽略未知字段）。
 
-3 个 `#[ignore]` 都需要 `python3` + `tests/fixtures/fake_mcp_server.py`，跑法：
+RAG 相关 16 个：`src/agent/rag/store.rs` 12 个（余弦五态：相同/平行/正交/相反/零向量；空向量与维度守卫；降序排序、top_k 截断/为 0、空库、查询维度不符），全部离线；`src/agent/rag/embed.rs` 4 个（1 个 ignored：请求体序列化、首条向量提取、空 data 报错；真实端点联测）。
+
+4 个 `#[ignore]` 里，3 个 MCP 集成测试需要 `python3` + `tests/fixtures/fake_mcp_server.py`，1 个 embedding 联测需要 `EMBEDDING_*` 凭证；跑法都是：
 
 ```bash
 cargo test --lib -- --ignored
@@ -87,6 +90,7 @@ cargo test --lib -- --ignored
 | `GAIA_LIMIT` | 否 | GAIA 单轮题量，缺失或非法时回退到 `constant::gaia::DEFAULT_GAIA_LIMIT`（10） |
 | `MAX_COMPLETION_TOKENS` | 否 | 每次请求的输出 token 上限，缺失或非法时回退到 `constant::provider::DEFAULT_MAX_TOKENS`（**8192**）。**推理模型要显著调大**——reasoning 分片同样计入这个预算，见 `@rules/architecture.md` 第 6 节 |
 | `TAVILY_API_KEY` | 仅 web_search 工具 | Tavily 搜索接口认证，变量名常量在 `constant::search` |
+| `EMBEDDING_API_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL_ID` | 仅 rag 模块与 `rag_chat` 示例 | embedding 端点、认证与模型 ID，三个都必填；**不随 `CURRENT_USE_PROVIDER` 切换**。变量名常量在 `constant::embedding` |
 
 可用的 provider 及各自的变量名在 `src/constant/provider.rs` 的 `PROVIDER_BASE_URL_VARS` 中定义——新增一个 provider 要改那里。
 

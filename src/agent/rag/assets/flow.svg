@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 660" width="960" height="660" role="img" aria-labelledby="rag-flow-title" font-family="'PingFang SC','Noto Sans SC','Microsoft YaHei',-apple-system,'Segoe UI',sans-serif">
+  <title id="rag-flow-title">RAG 模块组件与交互流程</title>
+  <defs>
+    <marker id="arr-gray" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#57606a"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a7f37"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0969da"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="660" rx="12" fill="#ffffff"/>
+
+  <rect x="290" y="120" width="380" height="480" rx="16" fill="none" stroke="#8c959f" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <text x="316" y="147" font-size="13" fill="#57606a">Retriever（组装层）</text>
+
+  <rect x="340" y="170" width="280" height="100" rx="10" fill="#ddf4ff" stroke="#54aeff" stroke-width="1.5"/>
+  <text x="480" y="202" font-size="15" font-weight="700" text-anchor="middle" fill="#0550ae" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">Embedder</text>
+  <text x="480" y="230" font-size="12" text-anchor="middle" fill="#0550ae">把文本编码为向量</text>
+  <text x="480" y="252" font-size="11" text-anchor="middle" fill="#57606a">读 EMBEDDING_* 配置</text>
+
+  <rect x="340" y="420" width="280" height="120" rx="10" fill="#dafbe1" stroke="#4ac26b" stroke-width="1.5"/>
+  <text x="480" y="450" font-size="15" font-weight="700" text-anchor="middle" fill="#116329" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">InMemoryStore</text>
+  <text x="480" y="476" font-size="11" text-anchor="middle" fill="#116329">存（向量 + 原文）</text>
+  <text x="480" y="498" font-size="11" text-anchor="middle" fill="#57606a">检索：全扫余弦 &#8594; 降序 &#8594; 取 top-k</text>
+  <text x="480" y="520" font-size="11" text-anchor="middle" fill="#57606a">入库守卫：首条定 dim，逐条校验</text>
+
+  <rect x="60" y="178" width="190" height="64" rx="10" fill="#dafbe1" stroke="#4ac26b" stroke-width="1.5"/>
+  <text x="155" y="206" font-size="14" text-anchor="middle" fill="#116329">文本</text>
+  <text x="155" y="227" font-size="11" text-anchor="middle" fill="#57606a">待入库原文</text>
+
+  <rect x="60" y="330" width="190" height="64" rx="10" fill="#ddf4ff" stroke="#54aeff" stroke-width="1.5"/>
+  <text x="155" y="358" font-size="14" text-anchor="middle" fill="#0550ae">问题</text>
+  <text x="155" y="379" font-size="11" text-anchor="middle" fill="#57606a">查询语句</text>
+
+  <rect x="740" y="170" width="200" height="100" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="840" y="196" font-size="13" text-anchor="middle" fill="#24292f">Embedding 端点</text>
+  <text x="840" y="218" font-size="11" text-anchor="middle" fill="#57606a">（外部服务）</text>
+  <text x="840" y="241" font-size="11" text-anchor="middle" fill="#57606a" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">POST /v1/embeddings</text>
+  <text x="840" y="260" font-size="11" text-anchor="middle" fill="#57606a" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">&#8646; Vec&lt;f32&gt;</text>
+
+  <rect x="720" y="430" width="200" height="90" rx="10" fill="#ddf4ff" stroke="#54aeff" stroke-width="1.5"/>
+  <text x="820" y="462" font-size="13" text-anchor="middle" fill="#0550ae">top-k 结果</text>
+  <text x="820" y="486" font-size="11" text-anchor="middle" fill="#0550ae" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">Vec&lt;SearchHit&gt;</text>
+  <text x="820" y="506" font-size="11" text-anchor="middle" fill="#57606a">score + 原文</text>
+
+  <path d="M 250 210 H 340" fill="none" stroke="#1a7f37" stroke-width="1.6" marker-end="url(#arr-green)"/>
+  <path d="M 250 362 H 280 V 250 H 340" fill="none" stroke="#0969da" stroke-width="1.6" marker-end="url(#arr-blue)"/>
+  <path d="M 700 205 H 740" fill="none" stroke="#57606a" stroke-width="1.6" marker-end="url(#arr-gray)"/>
+  <path d="M 700 205 H 620" fill="none" stroke="#57606a" stroke-width="1.6" marker-end="url(#arr-gray)"/>
+  <path d="M 420 270 V 420" fill="none" stroke="#1a7f37" stroke-width="1.6" marker-end="url(#arr-green)"/>
+  <path d="M 540 270 V 420" fill="none" stroke="#0969da" stroke-width="1.6" marker-end="url(#arr-blue)"/>
+  <path d="M 620 480 H 720" fill="none" stroke="#0969da" stroke-width="1.6" marker-end="url(#arr-blue)"/>
+
+  <g font-size="11" font-weight="700" text-anchor="middle">
+    <circle cx="295" cy="210" r="9" fill="#ffffff" stroke="#1a7f37" stroke-width="1.5"/>
+    <text x="295" y="214" fill="#1a7f37">1</text>
+    <circle cx="700" cy="205" r="9" fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+    <text x="700" y="209" fill="#57606a">2</text>
+    <circle cx="420" cy="300" r="9" fill="#ffffff" stroke="#1a7f37" stroke-width="1.5"/>
+    <text x="420" y="304" fill="#1a7f37">3</text>
+    <circle cx="280" cy="300" r="9" fill="#ffffff" stroke="#0969da" stroke-width="1.5"/>
+    <text x="280" y="304" fill="#0969da">4</text>
+    <circle cx="540" cy="300" r="9" fill="#ffffff" stroke="#0969da" stroke-width="1.5"/>
+    <text x="540" y="304" fill="#0969da">5</text>
+  </g>
+
+  <text x="295" y="191" font-size="11" text-anchor="middle" fill="#1a7f37" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">ingest(text)</text>
+  <text x="262" y="304" font-size="11" text-anchor="end" fill="#0969da" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">retrieve(query, k)</text>
+  <text x="702" y="228" font-size="11" text-anchor="middle" fill="#57606a" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">embed()</text>
+  <text x="433" y="328" font-size="11" fill="#1a7f37" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">insert(Chunk)</text>
+  <text x="552" y="328" font-size="11" fill="#0969da" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">search(query, k)</text>
+</svg>

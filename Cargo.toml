@@ -10,7 +10,7 @@ path = "examples/stream_chat.rs"
 
 [dependencies]
 anyhow = "1.0.102"
-async-openai = { version = "0.41.0", features = ["chat-completion"] }
+async-openai = { version = "0.41.0", features = ["chat-completion", "embedding"] }
 async-stream = "0.3.6"
 async-trait = "0.1.92"
 backon = "1.6.0"

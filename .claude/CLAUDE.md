@@ -10,6 +10,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **MCP 工具支持已落地**：`src/tools/mcp/` 通过 **stdio** 启动本地 MCP server、发现工具并适配成本地 `Tool`（一期仅 `tools`、仅 stdio）。本地（进程内）工具放在 `src/tools/local/`，每个工具一个子目录。
 
+**RAG 检索切片已落地**：`src/agent/rag/` 的 `Embedder`（文本 → 向量，走独立的 `EMBEDDING_*` 配置）+ `InMemoryStore`（内存向量库，全扫余弦取 top-k）+ `Retriever`（组装层）打通「入库 → 检索」链路；模块说明与交互流程图见 `src/agent/rag/README.md`。尚未做的：长文切块、持久化、接入 ReAct。
+
 仍缺的是**对话历史的截断/摘要策略**——`History` 只增不减，长会话迟早撑爆 context。流式的工具调用已经实现（`ToolCallAccumulator` 按 `index` 重组分片），所以 `ReactLoop` 的流式与非流式两条路都能调工具。
 
 ## 分层与依赖方向
@@ -39,6 +41,9 @@ src/tools/         工具层：spec / execute
 | `src/agent/react/runner.rs` | `ReactLoop`：循环推进、工具派发、终止判定。`run` 同时接收 `on_step` 与 `on_token` 两个回调（原 `run_stream` 已并入 `run`） |
 | `src/agent/react/history.rs` | `History`：消息序列的薄封装（`system`/`user`/`assistant`/`tool` + `as_slice`） |
 | `src/agent/react/models.rs` | 编排层词汇：`Step` / `Termination` / `Outcome` / `DEFAULT_MAX_TURNS` |
+| `src/agent/rag/embed.rs` | `Embedder`：文本 → `Vec<f32>`。端点与模型经 `provider::embedding_client_config()` / `embedding_model_id()` 从 `EMBEDDING_*` 读取，与 provider 选择解耦 |
+| `src/agent/rag/store.rs` | `InMemoryStore`：`Chunk { vector, text }` 入库（维度守卫）+ `search` 全扫余弦、降序取 top-k，返回 `SearchHit { score, text }`；`cosine_similarity` 是私有纯函数 |
+| `src/agent/rag/retriever.rs` | `Retriever` 组装层：`ingest(text)` = embed + insert，`retrieve(query, top_k)` = embed + search |
 | `src/tools/tool.rs` | `Tool` trait：`name` / `description` / `parameters` / `execute`；`definition()` 是默认实现，产出 wire format |
 | `src/tools/local/web_search/mod.rs` | web_search 工具：参数/响应类型与 `Tool` 实现合并在一个文件 |
 | `src/tools/local/final_answer/mod.rs` | final_answer 工具：最终答案的收尾通道。`execute` **输入即输出**（原样返回 `answer` 参数），`extract_answer` 供循环做终止判定 |
@@ -47,10 +52,10 @@ src/tools/         工具层：spec / execute
 | `src/tools/mcp/tool.rs` | `McpTool`：远端工具 -> 本地 `Tool` 适配（命名、调用、`CallToolResult` 映射） |
 | `src/tools/mod.rs` | `ToolHashMap`（`HashMap<String, Arc<dyn Tool>>`，值用 `Arc` 所以整张表可廉价克隆）与 `build_tools()`（异步、合并本地 + MCP）/ `build_tools_with(config)`（不读文件的测试接缝） |
 | `src/gaia/` | 独立的评测垂直切片：HF 拉数据集 → 每题分别按「直答」与「ReAct + 工具」两种模式求解 → 比对答案（`report.rs` 按模型×模式汇总通过率）。除借用 `llm::provider` 的客户端配置外，带工具模式还向下依赖 `agent::react`（`ReactLoop`）与 `tools` |
-| `src/constant/` | 按领域分的字面量常量：`provider.rs`（provider 名与凭证环境变量名）、`prompt.rs`（`SYSTEM_PROMPT`）、`gaia.rs`（评测参数）。模型 ID 本身走 `CURRENT_USE_MODEL_ID`，不硬编码 |
+| `src/constant/` | 按领域分的字面量常量：`provider.rs`（provider 名与凭证环境变量名）、`prompt.rs`（`SYSTEM_PROMPT`）、`gaia.rs`（评测参数）、`embedding.rs`（embedding 端点与模型的环境变量名）。模型 ID 本身走 `CURRENT_USE_MODEL_ID`，不硬编码 |
 | `src/bootstrap.rs` | dotenv + tracing 的统一初始化入口 |
 
-可执行入口：`src/main.rs`（`History` + `LLMClient::complete` 的单轮 demo）、`src/bin/gaia.rs`（GAIA 对比评测：每题各跑一次「带工具 / 不带工具」，输出两组通过数与通过率）。`examples/` 下八个：
+可执行入口：`src/main.rs`（`History` + `LLMClient::complete` 的单轮 demo）、`src/bin/gaia.rs`（GAIA 对比评测：每题各跑一次「带工具 / 不带工具」，输出两组通过数与通过率）。`examples/` 下九个：
 
 | 示例 | 演示什么 |
 |---|---|
@@ -62,6 +67,7 @@ src/tools/         工具层：spec / execute
 | `mcp_probe` | 连接一个 stdio MCP server，打印/调用适配出的工具（默认用 `tests/fixtures/fake_mcp_server.py`） |
 | `mcp_react` | 端到端：用户提问 → ReAct 循环 → 调用 MCP 工具 → 汇总回答（脚本化 `Completer`，无需 LLM 凭证） |
 | `mcp_chat` | 真实 LLM + MCP：从 `mcp.json` 加载工具，模型自主决定是否调用（需要凭证与 `mcp.json`） |
+| `rag_chat` | 端到端检索：ingest 若干文本 → 提问 → 打印 top-k 与 score（需 `EMBEDDING_*` 凭证） |
 
 ## 深入阅读
 

@@ -8,7 +8,10 @@
       "Bash(timeout 15 curl -sS -o /dev/null -w \"static.crates.io:%{http_code}\\\\n\" https://static.crates.io/)",
       "Read(//home/tomato0v0/.cargo/registry/src/**)",
       "Bash(timeout 120 npx ctx7@latest library \"syn\" \"writing a derive macro: DeriveInput, parse_macro_input, helper attributes, generating impl with quote\")",
-      "Bash(timeout 180 npx ctx7@latest docs /dtolnay/syn \"how to write a custom derive proc macro: DeriveInput, parse_macro_input, reading struct fields, helper attributes, and what changed in syn 3.0 vs 2.0\")"
+      "Bash(timeout 180 npx ctx7@latest docs /dtolnay/syn \"how to write a custom derive proc macro: DeriveInput, parse_macro_input, reading struct fields, helper attributes, and what changed in syn 3.0 vs 2.0\")",
+      "WebSearch",
+      "Bash(grep -v '^$')",
+      "Bash(grep -v ':0$')"
     ]
   }
 }

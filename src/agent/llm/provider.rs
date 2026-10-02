@@ -1,6 +1,9 @@
 use async_openai::config::OpenAIConfig;
 use std::sync::OnceLock;
 
+use crate::constant::embedding::{
+    EMBEDDING_API_BASE_URL_ENV, EMBEDDING_API_KEY_ENV, EMBEDDING_MODEL_ID_ENV,
+};
 use crate::constant::provider::{
     DEFAULT_MAX_TOKENS, DEFAULT_PROVIDER, MAX_TOKENS_ENV, MODEL_ID_ENV, OPENROUTER,
     PROVIDER_BASE_URL_VARS, PROVIDER_ENV,
@@ -55,6 +58,24 @@ pub fn client_config() -> anyhow::Result<OpenAIConfig> {
     Ok(OpenAIConfig::new()
         .with_api_base(read(base_url_var)?)
         .with_api_key(read(api_key_var)?))
+}
+
+pub fn embedding_model_id() -> anyhow::Result<String> {
+    std::env::var(EMBEDDING_MODEL_ID_ENV).map_err(|_| {
+        anyhow::anyhow!(
+            "缺少环境变量 {}，请填写 embedding 模型 ID",
+            EMBEDDING_MODEL_ID_ENV
+        )
+    })
+}
+
+pub fn embedding_client_config() -> anyhow::Result<OpenAIConfig> {
+    let read =
+        |var: &str| std::env::var(var).map_err(|_| anyhow::anyhow!("embedding 缺少环境变量 {var}"));
+
+    Ok(OpenAIConfig::new()
+        .with_api_base(read(EMBEDDING_API_BASE_URL_ENV)?)
+        .with_api_key(read(EMBEDDING_API_KEY_ENV)?))
 }
 
 pub fn supports_json_schema() -> bool {

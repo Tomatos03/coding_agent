@@ -8,6 +8,7 @@
 src/
 ├── agent/
 │   ├── llm/          # LLM 客户端、provider 配置、并发信号量
+│   ├── rag/          # RAG 检索：embed / store / retriever（说明见 rag/README.md）
 │   └── react/        # ReAct 循环（runner/history/models）
 ├── tools/
 │   ├── tool.rs       # Tool trait
@@ -96,6 +97,12 @@ server 名（即 `mcpServers` 的键）只能包含字母、数字、下划线�
 | 端点 400 拒绝 `tool_choice` | 打告警，后续请求降级为 `auto` 重发一次 |
 | 未声明任何工具（如 `stream_chat`） | 请求体不带 `tool_choice` |
 
+## RAG 检索（内存版）
+
+`src/agent/rag/` 打通「文本入库 → 向量检索」链路：`Embedder`（文本 → 向量）、`InMemoryStore`（内存向量库，全扫余弦取 top-k）、`Retriever`（组装层）。embedding 端点独立配置（`EMBEDDING_*` 环境变量），与 LLM provider 解耦。
+
+组件说明与交互流程图见 [`src/agent/rag/README.md`](src/agent/rag/README.md)。当前边界：无切块、无持久化、未接入 ReAct。
+
 ## 运行
 
 ```bash
@@ -119,6 +126,10 @@ cargo run --example mcp_react -- npx -y @modelcontextprotocol/server-everything
 
 # ReAct 对话示例
 cargo run --example react_chat -- "什么是 MCP?"
+
+# RAG 端到端检索：ingest 若干文本 → 提问 → 打印 top-k（会真实调用 embedding 端点，需要 EMBEDDING_*）
+cargo run --example rag_chat
+cargo run --example rag_chat -- "余弦相似度怎么算？"
 
 # 真实 LLM + MCP：先准备好 mcp.json 与 .env（会真实调用 LLM）
 cargo run --example mcp_chat

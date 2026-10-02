@@ -1,18 +1,21 @@
 # 架构约束与陷阱
 
-以下每一条都需要同时读多个文件才能拼出来。第 1、2、6 节是需要照搬的既有模式，第 3、4、5 节属于「违反时不会报错、只会静默出错」的陷阱，第 8 节是 MCP 工具层的结构与边界。
+以下每一条都需要同时读多个文件才能拼出来。第 1、2、6 节是需要照搬的既有模式，第 3、4、5 节属于「违反时不会报错、只会静默出错」的陷阱，第 8 节是 MCP 工具层的结构与边界，第 9 节是 RAG 检索层（内存版）。
 
-## 1. 客户端构造只有一条路径：`provider::client_config()`
+## 1. 客户端构造只有两条路径：`provider::client_config()` 与 `embedding_client_config()`
 
-所有 `async_openai::Client` 都经 `src/agent/llm/provider.rs` 的 `client_config()` 构造：
+所有 `async_openai::Client` 都经 `src/agent/llm/provider.rs` 构造，按用途分两条：
 
 ```rust
-let client = async_openai::Client::with_config(provider::client_config()?);
+let client = async_openai::Client::with_config(provider::client_config()?);           // 对话
+let client = async_openai::Client::with_config(provider::embedding_client_config()?); // embedding
 ```
 
-现被两处共用：`src/agent/llm/models.rs` 的 `LLMClient::new`、`src/gaia/solver.rs` 的 `solve_gaia_question`。
+`client_config()` 现被两处共用：`src/agent/llm/models.rs` 的 `LLMClient::new`、`src/gaia/solver.rs` 的 `solve_gaia_question`。
 
 它按 `CURRENT_USE_PROVIDER`（缺失时回退到 `constant::provider::DEFAULT_PROVIDER`）在 `constant::provider::PROVIDER_BASE_URL_VARS` 中查出该 provider 对应的 `*_API_BASE_URL` 与 `*_API_KEY` 两个环境变量名，任一缺失都报错并指明是哪个 provider 的哪个变量。
+
+`embedding_client_config()` 现由 `src/agent/rag/embed.rs` 的 `Embedder::new` 独用，配套的模型 ID 由 `embedding_model_id()` 读取。两者直接读 `EMBEDDING_API_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL_ID`（变量名常量在 `constant::embedding`），**不随 `CURRENT_USE_PROVIDER` 切换**。
 
 **不要写成 `async_openai::Client::new()`**——那走的是 `OpenAIConfig::default()`，读的是 `async-openai` 自己的 `OPENAI_BASE_URL`，本项目 `.env` 里没有这个变量，会静默 fallback 到 `https://api.openai.com/v1`，表现为认证失败或 404，而不是「没读到 base url」这种直观报错。跨模块搬运代码时尤其注意。
 
@@ -166,3 +169,13 @@ pub struct ChatCompletionStreamResponseDelta {
 - **不支持**：MRTR（`InputRequired`）与 tasks（`Task`）响应直接报错；不做运行时工具列表热刷新，也不重连。子进程异常退出只能在**下一次调用**时报错暴露。
 - **日志**：MCP 相关日志统一 `target: "mcp"`，便于过滤；但 `bootstrap.rs` 的 subscriber 固定 `with_max_level(INFO)`，`debug`（server stderr）默认不可见。
 - **测试 fixture**：`tests/fixtures/fake_mcp_server.py` 是手写裸 JSON-RPC 的最小 server（`echo` / `add` / `fail`），3 个 `#[ignore]` 集成测试依赖本机 `python3`，跑法 `cargo test --lib -- --ignored`。
+
+## 9. RAG 检索层（内存版）
+
+`src/agent/rag/` 把检索拆成三个组件：`Embedder`（文本 → `Vec<f32>`）、`InMemoryStore`（内存向量库）、`Retriever`（组装层）。完整说明与流程图见 `src/agent/rag/README.md`；这里只列跨组件的陷阱：
+
+- **入库与查询必须同一 embedding 模型。** 更换 `EMBEDDING_MODEL_ID` 而沿用旧数据 = 拿错尺子量：分数照算、零报错，只是全部无意义。换模型必须重建索引。
+- **维度守卫在 `InMemoryStore::insert`**：首条入库定下 `dim`，此后逐条校验；`search` 同样校验查询向量。缺了它，`zip` 对不等长切片**静默截断**（同第 5 节「违反不报错」家族）。
+- **余弦而非欧氏距离**：文本 embedding 按余弦训练。零范数返回 `0.0` 防 NaN 传播；排序用 `total_cmp`（NaN 会让 `partial_cmp` 返回 `None`）。
+- **`cosine_similarity` 是私有纯函数**，唯一生产调用方是 `search`（维度已由 store 校验），外部需要再放开。
+- **边界**：无切块、无持久化、未接入 ReAct；store 只收算好的向量（不碰网络），因此它的测试完全离线。
