@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 660" width="960" height="660" role="img" aria-labelledby="react-flow-title" font-family="'PingFang SC','Noto Sans SC','Microsoft YaHei',-apple-system,'Segoe UI',sans-serif">
+  <title id="react-flow-title">ReAct 模块组件与交互流程</title>
+  <defs>
+    <marker id="arr-gray" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#57606a"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1a7f37"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="10" refY="5" markerWidth="8" markerHeight="8" markerUnits="userSpaceOnUse" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0969da"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="960" height="660" rx="12" fill="#ffffff"/>
+
+  <rect x="250" y="80" width="420" height="360" rx="16" fill="none" stroke="#8c959f" stroke-width="1.5" stroke-dasharray="6 5"/>
+  <text x="272" y="106" font-size="13" fill="#57606a">ReactLoop::run（turn 1..=max_turns）</text>
+
+  <rect x="40" y="150" width="150" height="120" rx="10" fill="#dafbe1" stroke="#4ac26b" stroke-width="1.5"/>
+  <text x="115" y="182" font-size="14" font-weight="700" text-anchor="middle" fill="#116329" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">History</text>
+  <text x="115" y="206" font-size="11" text-anchor="middle" fill="#116329" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">system / user /</text>
+  <text x="115" y="226" font-size="11" text-anchor="middle" fill="#116329" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">assistant / tool</text>
+  <text x="115" y="248" font-size="11" text-anchor="middle" fill="#57606a">只增不减</text>
+
+  <rect x="290" y="120" width="340" height="110" rx="10" fill="#ddf4ff" stroke="#54aeff" stroke-width="1.5"/>
+  <text x="460" y="152" font-size="15" font-weight="700" text-anchor="middle" fill="#0550ae" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">thinking()</text>
+  <text x="460" y="178" font-size="11" text-anchor="middle" fill="#0550ae">Completer::stream（tool_choice = required）</text>
+  <text x="460" y="204" font-size="11" text-anchor="middle" fill="#57606a" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">&#8594; Reply { content, tool_calls }</text>
+
+  <rect x="290" y="320" width="340" height="80" rx="10" fill="#ddf4ff" stroke="#54aeff" stroke-width="1.5"/>
+  <text x="460" y="348" font-size="14" font-weight="700" text-anchor="middle" fill="#0550ae" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">action() &#8594; execute()</text>
+  <text x="460" y="372" font-size="11" text-anchor="middle" fill="#0550ae">Step::Action &#8594; 执行 &#8594; Step::Observation</text>
+  <text x="460" y="394" font-size="11" text-anchor="middle" fill="#57606a">失败 / 未知工具都压成 Observation</text>
+
+  <rect x="730" y="110" width="190" height="170" rx="10" fill="#dafbe1" stroke="#4ac26b" stroke-width="1.5"/>
+  <text x="825" y="140" font-size="13" font-weight="700" text-anchor="middle" fill="#116329">交付（Step::Answer）</text>
+  <text x="825" y="168" font-size="11" text-anchor="middle" fill="#116329">Termination：</text>
+  <text x="825" y="190" font-size="11" text-anchor="middle" fill="#116329" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">· FinalAnswer</text>
+  <text x="825" y="210" font-size="11" text-anchor="middle" fill="#116329" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">· ModelFinished</text>
+  <text x="825" y="230" font-size="11" text-anchor="middle" fill="#116329" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">· EmptyReply</text>
+  <text x="825" y="250" font-size="11" text-anchor="middle" fill="#116329" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">· MaxTurns</text>
+
+  <rect x="290" y="510" width="340" height="110" rx="10" fill="#ddf4ff" stroke="#54aeff" stroke-width="1.5"/>
+  <text x="460" y="540" font-size="14" font-weight="700" text-anchor="middle" fill="#0550ae" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">finalize()</text>
+  <text x="460" y="564" font-size="11" text-anchor="middle" fill="#0550ae">工具面裁到只剩 final_answer</text>
+  <text x="460" y="586" font-size="11" text-anchor="middle" fill="#57606a">以 Force(final_answer) 强制一轮</text>
+  <text x="460" y="608" font-size="11" text-anchor="middle" fill="#57606a">软着陆：content &#8594; 固定兜底文案</text>
+
+  <rect x="40" y="470" width="240" height="90" rx="10" fill="#f6f8fa" stroke="#8c959f" stroke-width="1.5" stroke-dasharray="5 4"/>
+  <text x="160" y="500" font-size="13" font-weight="700" text-anchor="middle" fill="#24292f" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">ExecuteContext</text>
+  <text x="160" y="524" font-size="11" text-anchor="middle" fill="#57606a">逐轮事件流 &#8594; tracing（observe）</text>
+  <text x="160" y="546" font-size="11" text-anchor="middle" fill="#57606a">唯一 ID + Status 流转</text>
+
+  <path d="M 190 185 H 290" fill="none" stroke="#0969da" stroke-width="1.6" marker-end="url(#arr-blue)"/>
+  <path d="M 630 150 H 730" fill="none" stroke="#1a7f37" stroke-width="1.6" marker-end="url(#arr-green)"/>
+  <path d="M 630 195 H 730" fill="none" stroke="#1a7f37" stroke-width="1.6" marker-end="url(#arr-green)"/>
+  <path d="M 400 230 V 320" fill="none" stroke="#0969da" stroke-width="1.6" marker-end="url(#arr-blue)"/>
+  <path d="M 520 320 V 230" fill="none" stroke="#0969da" stroke-width="1.6" marker-end="url(#arr-blue)"/>
+  <path d="M 290 360 H 115 V 270" fill="none" stroke="#0969da" stroke-width="1.6" marker-end="url(#arr-blue)"/>
+  <path d="M 460 400 V 510" fill="none" stroke="#1a7f37" stroke-width="1.6" marker-end="url(#arr-green)"/>
+  <path d="M 630 555 H 825 V 280" fill="none" stroke="#1a7f37" stroke-width="1.6" marker-end="url(#arr-green)"/>
+  <path d="M 270 440 V 470" fill="none" stroke="#57606a" stroke-width="1.6" stroke-dasharray="4 4" marker-end="url(#arr-gray)"/>
+
+  <g font-size="11" font-weight="700" text-anchor="middle">
+    <circle cx="240" cy="185" r="9" fill="#ffffff" stroke="#0969da" stroke-width="1.5"/>
+    <text x="240" y="189" fill="#0969da">1</text>
+    <circle cx="680" cy="150" r="9" fill="#ffffff" stroke="#1a7f37" stroke-width="1.5"/>
+    <text x="680" y="154" fill="#1a7f37">2</text>
+    <circle cx="680" cy="195" r="9" fill="#ffffff" stroke="#1a7f37" stroke-width="1.5"/>
+    <text x="680" y="199" fill="#1a7f37">3</text>
+    <circle cx="400" cy="275" r="9" fill="#ffffff" stroke="#0969da" stroke-width="1.5"/>
+    <text x="400" y="279" fill="#0969da">4</text>
+    <circle cx="202" cy="360" r="9" fill="#ffffff" stroke="#0969da" stroke-width="1.5"/>
+    <text x="202" y="364" fill="#0969da">5</text>
+    <circle cx="520" cy="275" r="9" fill="#ffffff" stroke="#0969da" stroke-width="1.5"/>
+    <text x="520" y="279" fill="#0969da">6</text>
+    <circle cx="460" cy="455" r="9" fill="#ffffff" stroke="#1a7f37" stroke-width="1.5"/>
+    <text x="460" y="459" fill="#1a7f37">7</text>
+  </g>
+
+  <text x="240" y="169" font-size="11" text-anchor="middle" fill="#0969da">请求</text>
+  <text x="680" y="135" font-size="11" text-anchor="middle" fill="#1a7f37" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">final_answer</text>
+  <text x="680" y="180" font-size="11" text-anchor="middle" fill="#1a7f37">纯文本 / 空回复</text>
+  <text x="388" y="279" font-size="11" text-anchor="end" fill="#0969da">逐个执行工具</text>
+  <text x="532" y="279" font-size="11" fill="#0969da">下一轮请求</text>
+  <text x="202" y="344" font-size="11" text-anchor="middle" fill="#0969da">Observation 回填</text>
+  <text x="448" y="459" font-size="11" text-anchor="end" fill="#1a7f37">跑满 max_turns</text>
+  <text x="727" y="547" font-size="11" text-anchor="middle" fill="#1a7f37">软着陆（MaxTurns）</text>
+</svg>
