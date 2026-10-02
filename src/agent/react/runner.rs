@@ -205,15 +205,14 @@ impl ReactLoop {
             let ChatCompletionMessageToolCalls::Function(func) = call else {
                 continue;
             };
-            let content;
-            if func.id == delivered.id {
+            let content = if func.id == delivered.id {
                 self.history.tool(&func.id, answer)?;
-                content = answer;
+                answer
             } else {
                 self.history.tool(&func.id, SKIPPED_CALL_NOTE)?;
                 skipped.push(func.function.name.clone());
-                content = SKIPPED_CALL_NOTE;
-            }
+                SKIPPED_CALL_NOTE
+            };
             context.push_event(Event::new(EventName::ToolResult, content, Role::Tool));
         }
 
