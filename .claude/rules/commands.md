@@ -11,19 +11,20 @@ cargo run --example web_search     # 裸 HTTP 打 Tavily + 响应解析
 cargo run --example tool_exec      # 不走 LLM，直接验证「注册表 → trait 对象 → execute」
 cargo run --example mcp_probe      # 连接 stdio MCP server，打印/调用适配出的工具（默认用测试 fixture）
 cargo run --example mcp_react      # 端到端：用户提问 → ReAct → 调用 MCP（脚本化模型，无需 LLM 凭证）
+cargo run --example callback_react # 回调链：观察掩蔽 + 窗口裁剪 + 动态注入 + 回复脱敏（脚本化模型，无需 LLM 凭证）
 cargo run --example mcp_chat       # 真实 LLM + MCP：从 mcp.json 加载工具，模型自主调用（需要凭证与 mcp.json）
 cargo run --example rag_chat       # 端到端检索：ingest 若干文本 → 提问 → 打印 top-k（需 EMBEDDING_* 凭证）
 cargo fmt
 cargo clippy                       # 当前 -- -D warnings 下零告警
 ```
 
-`react_chat`、`stream_chat`、`mcp_chat` 需要 LLM provider 的凭证（`mcp_chat` 还需要 `mcp.json`）；`web_search` 与 `tool_exec` 另外需要 Tavily 的凭证；`mcp_probe` 与 `mcp_react` 用自带假 server 时不需要任何凭证（只需 `python3`）；`rag_chat` 需要 embedding 凭证（`EMBEDDING_*`）。
+`react_chat`、`stream_chat`、`mcp_chat` 需要 LLM provider 的凭证（`mcp_chat` 还需要 `mcp.json`）；`web_search` 与 `tool_exec` 另外需要 Tavily 的凭证；`mcp_probe`、`mcp_react` 与 `callback_react` 用自带假 server / 脚本化模型时不需要任何凭证（`mcp_probe`、`mcp_react` 只需 `python3`）；`rag_chat` 需要 embedding 凭证（`EMBEDDING_*`）。
 
 ## 测试
 
-**当前 96 个测试**：默认跑 92 个（全部离线，不联网、不需要凭证），另外 4 个是 `#[ignore]`：3 个 MCP 集成测试（需要本机 `python3`）+ 1 个 embedding 真实端点联测（需要 `EMBEDDING_*` 凭证）。
+**当前 235 个测试**：默认跑 231 个（全部离线，不联网、不需要凭证），另外 4 个是 `#[ignore]`：3 个 MCP 集成测试（需要本机 `python3`）+ 1 个 embedding 真实端点联测（需要 `EMBEDDING_*` 凭证）。下列按文件列举重点覆盖，非全部测试。
 
-`src/agent/react/runner.rs` 17 个，覆盖循环逻辑：
+`src/agent/react/runner.rs` 18 个，覆盖循环逻辑：
 
 - 调 `final_answer` → `Termination::FinalAnswer`，答案取 `execute` 的返回值，且该调用有配对 tool 消息
 - 纯文本回复（无 tool_calls）→ 端点无视了 `required`，降级为 `Termination::ModelFinished`；同时断言循环内收到的策略是 `Required`
@@ -40,6 +41,7 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 - `execute()` 把工具失败与未知工具名压成观察文案（「工具执行失败：…」/「未知工具：…」），并能执行 `final_answer`（输入即输出）
 - **收尾轮发 `Step::Answer` 而非 `Thought`** → 断言完整事件序列 `[(1,action),(1,observation),(2,answer)]`
 - **中间轮的 content 发 `Step::Thought`** → 断言 `[(1,thought),(1,action),(1,observation),(2,answer)]`
+- 回调 `BeforeSend` 注入的消息到达传输层、但**不落 History** → 钉住「线上 ≠ 存档」
 
 后两条用 `trace()` 辅助函数把 `Step` 压成 `(轮次, 类型)` 序列做整体比对——比逐个 `assert!(matches!(...))` 更能钉住**顺序**，而这两条的核心正是发射顺序。
 
@@ -50,6 +52,8 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 - 流式分片重组（`ToolCallAccumulator`）3 个：单个调用的 `arguments` 被切成 4 片 → 拼回完整字符串；两个调用的分片交错到达 → 各归各的槽位；中间有空槽位 → `finish()` 丢掉没拿到 `name` 的
 - 策略 → 请求体 3 个（`build_chat_request` 纯函数，序列化后断言）：`Required` → `tool_choice == "required"` 且 `parallel_tool_calls == true`；`Force("final_answer")` → `tool_choice == {"type":"function",...}`；**`tools == None` 时 `tool_choice` 键必须消失**（否则 `required` + 零工具会被服务端 400 拒绝）
 - `tool_choice` 被拒判定 3 个：400 + `param:"tool_choice"`（或消息里点名）命中；429 / 500 / 不相关的 400 不命中；只有非 `Auto` 策略才值得重发
+
+`src/agent/llm/callback.rs` 8 个（全部离线；假内层传输层记录收到的消息并返回预置 `Reply`，假回调按事件记录轨迹）：`BeforeSend` 注入的消息送达内层；`AfterSend` 改写的 `Reply` 出现在返回值里；空回调列表 = 透传；洋葱顺序 `[outer:before, inner:before, inner:after, outer:after]` 且两层互相可见对方的改动；`BeforeSend` 报错时整个请求中止且内层**未被调用**（fail-closed）；`AfterSend` 报错即便回复已到手也传播；只处理 `BeforeSend` 的放行模板照常参与全链（两个事件都会送达）；stream 路径同样派发两种事件且 `on_token` 直通不受影响。
 
 `src/tools/local/final_answer/mod.rs` 5 个：`execute` 把输入参数原样返回、可重复调用（纯函数）、`extract_answer` 容忍首尾空白、拒绝非法 JSON / 缺字段 / 空串、`execute` 传播解析错误。
 

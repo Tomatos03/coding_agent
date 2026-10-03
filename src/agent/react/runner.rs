@@ -544,10 +544,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_openai::types::chat::{
-        ChatCompletionMessageToolCall, ChatCompletionRequestToolMessageContent, FunctionCall,
+        ChatCompletionMessageToolCall, ChatCompletionRequestToolMessageContent,
+        ChatCompletionRequestUserMessageArgs, FunctionCall,
     };
     use serde_json::{Value, json};
 
+    use crate::agent::llm::callback::{Callback, CallbackCompleter, CallbackEvent};
     use crate::agent::llm::models::{Reply, ToolPolicy};
     use crate::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
     use crate::agent::react::models::DEFAULT_MAX_TURNS;
@@ -636,6 +638,8 @@ mod tests {
         policies: Mutex<Vec<ToolPolicy>>,
         /// 每次请求实际暴露的工具名（排序后），用来断言收尾轮的裁剪。
         tool_names: Mutex<Vec<Vec<String>>>,
+        /// 每次请求实际收到的消息（已过回调链），用来钉住「线上 ≠ 历史」。
+        messages: Mutex<Vec<Vec<ChatCompletionRequestMessage>>>,
     }
 
     impl ScriptedCompleter {
@@ -644,16 +648,22 @@ mod tests {
                 replies: Mutex::new(replies),
                 policies: Mutex::new(Vec::new()),
                 tool_names: Mutex::new(Vec::new()),
+                messages: Mutex::new(Vec::new()),
             })
         }
 
         fn next(
             &self,
+            messages: &[ChatCompletionRequestMessage],
             tools: Option<&ToolHashMap>,
             policy: &ToolPolicy,
             on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
         ) -> anyhow::Result<Reply> {
             self.policies.lock().expect("锁被毒化").push(policy.clone());
+            self.messages
+                .lock()
+                .expect("锁被毒化")
+                .push(messages.to_vec());
 
             let mut names: Vec<String> = tools
                 .map(|tools| tools.keys().cloned().collect())
@@ -679,27 +689,31 @@ mod tests {
         fn tool_names(&self) -> Vec<Vec<String>> {
             self.tool_names.lock().expect("锁被毒化").clone()
         }
+
+        fn messages(&self) -> Vec<Vec<ChatCompletionRequestMessage>> {
+            self.messages.lock().expect("锁被毒化").clone()
+        }
     }
 
     #[async_trait::async_trait]
     impl Completer for ScriptedCompleter {
         async fn complete(
             &self,
-            _messages: &[ChatCompletionRequestMessage],
+            messages: &[ChatCompletionRequestMessage],
             tools: Option<&ToolHashMap>,
             policy: ToolPolicy,
         ) -> anyhow::Result<Reply> {
-            self.next(tools, &policy, &mut |_| {})
+            self.next(messages, tools, &policy, &mut |_| {})
         }
 
         async fn stream(
             &self,
-            _messages: &[ChatCompletionRequestMessage],
+            messages: &[ChatCompletionRequestMessage],
             tools: Option<&ToolHashMap>,
             policy: ToolPolicy,
             on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
         ) -> anyhow::Result<Reply> {
-            self.next(tools, &policy, on_token)
+            self.next(messages, tools, &policy, on_token)
         }
     }
 
@@ -854,6 +868,33 @@ mod tests {
             .iter()
             .filter(|m| matches!(m, ChatCompletionRequestMessage::Tool(_)))
             .count()
+    }
+
+    /// 构造一条 user 消息，供注入回调使用。
+    fn user_message(text: &str) -> ChatCompletionRequestMessage {
+        ChatCompletionRequestUserMessageArgs::default()
+            .content(text)
+            .build()
+            .expect("构造 user 消息失败")
+            .into()
+    }
+
+    /// 把消息序列化成 JSON 文本做包含判断。
+    fn message_text(message: &ChatCompletionRequestMessage) -> String {
+        serde_json::to_string(message).expect("序列化消息失败")
+    }
+
+    /// 在 `BeforeSend` 往尾部追加一条注入消息的回调。
+    struct InjectMessage(&'static str);
+
+    #[async_trait::async_trait]
+    impl Callback for InjectMessage {
+        async fn call(&self, event: CallbackEvent<'_>) -> anyhow::Result<()> {
+            if let CallbackEvent::BeforeSend { messages } = event {
+                messages.push(user_message(self.0));
+            }
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -1395,5 +1436,37 @@ mod tests {
         assert_eq!(outcome.termination, Termination::FinalAnswer);
         assert_eq!(executed.count(), 1, "放行的调用照常执行");
         assert_eq!(confirmer.call_count(), 0, "allow 不必咨询 confirmer");
+    }
+
+    #[tokio::test]
+    async fn before_send_injection_reaches_transport_but_not_history() {
+        const INJECTED: &str = "【注入】动态上下文（不应落历史）";
+
+        let scripted = ScriptedCompleter::new(vec![calls_final_answer("完成")]);
+        let completer: Arc<dyn Completer> = Arc::new(CallbackCompleter::new(
+            scripted.clone(),
+            vec![Arc::new(InjectMessage(INJECTED))],
+        ));
+        let mut agent = build(completer);
+
+        let outcome = agent
+            .run("原始任务", |_| {}, |_, _| {})
+            .await
+            .expect("run 失败");
+        assert_eq!(outcome.answer, "完成");
+
+        let seen = scripted.messages();
+        assert_eq!(seen.len(), 1, "只有一轮请求");
+        assert!(
+            seen[0].iter().any(|m| message_text(m).contains(INJECTED)),
+            "注入的消息应到达传输层"
+        );
+        assert!(
+            !agent
+                .history()
+                .iter()
+                .any(|m| message_text(m).contains(INJECTED)),
+            "注入的消息不应写进 History（线上 ≠ 存档）"
+        );
     }
 }

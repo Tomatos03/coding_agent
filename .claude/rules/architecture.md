@@ -181,3 +181,21 @@ pub struct ChatCompletionStreamResponseDelta {
 - **余弦而非欧氏距离**：文本 embedding 按余弦训练。零范数返回 `0.0` 防 NaN 传播；排序用 `total_cmp`（NaN 会让 `partial_cmp` 返回 `None`）。
 - **`cosine_similarity` 是私有纯函数**，唯一生产调用方是 `search`（维度已由 store 校验），外部需要再放开。
 - **边界**：无切块、无持久化、未接入 ReAct；store 只收算好的向量（不碰网络），因此它的测试完全离线。
+
+## 10. 消息发送前后的回调（`Callback`）
+
+`src/agent/llm/callback.rs` 在传输层唯一的接缝 `Completer` 外套一个透明装饰器 `CallbackCompleter`，在每轮请求前后派发回调链。`ReactLoop`、`History`、`src/tools/` 的**生产代码零改动**——不注册回调、不包装它时，全链路与没有这层时逐字节一致。
+
+**接缝形状。** 根特征 `Callback` 只有一个方法 `call(event)`，挂点做成数据（`CallbackEvent` 枚举）：`BeforeSend { messages: &mut Vec<_> }` 与 `AfterSend { messages: &[..], reply: &mut Reply }`。能力约束做进类型——`BeforeSend` 只给可变消息，`AfterSend` 消息只读、只有回复可改。枚举标 `#[non_exhaustive]`：将来新增挂点（工具前后、Step 事件等）只加变体，trait / 装饰器 / 既有实现都不变；实现用 `let CallbackEvent::X { .. } = event else { return Ok(()) };` 放行模板即可对新增变体免疫（外部 crate 的 `match` 必须带通配臂）。
+
+**洋葱顺序。** `BeforeSend` 正序、`AfterSend` 逆序（注册 `[Logger, Redactor]` 时，`Logger.AfterSend` 看到的是 `Redactor` 处理过的最终回复）。
+
+**线上 ≠ 存档（最关键的语义）。** `BeforeSend` 改的是「寄出去的信」：每轮从当前 `History` 重新克隆、重新派发，改动**不落历史**——这正是「发出去的比存下来的少」的裁剪刚需。`AfterSend` 改的是「回信」：`Reply` 回到 `ReactLoop` 后会原样落历史并驱动后续（改掉的 `tool_calls` 会被执行），因此它是**持久**的。想持久注入（如 RAG 片段要留给后续轮次）就不该用回调，那属于 `History` 的职责。
+
+**fail-closed。** 任一回调返回 `Err`，整个请求失败并向上传播（`BeforeSend` 报错时内层传输层**不会**被调用）——与审批闸门「要问但无人可问 → 拒绝」同一姿态。想「尽力而为」的实现应自己吞错（`tracing::warn!` 后返回 `Ok(())`）。流式下 `AfterSend` 报错时 token 可能已经打出去，无法回滚。
+
+**与四个不变量的关系。** 变异发生在 `ReactLoop` 看到 `Reply` **之前**，配对消息与终止判定都在最终值上计算；`AfterSend` 若删光 `tool_calls` 且 `content` 为空，会自然落入既有的 `Termination::EmptyReply`，不需要新分支。
+
+**前缀缓存约束（`BeforeSend` 的核心）。** 主流 provider 对 prompt 的**最长公共 token 前缀**做 KV 缓存，从第一个 token 起精确匹配：注入要**拼在尾部**（插开头 / 中间会让插入点之后全部 miss）；裁剪 / 掩蔽要**攒批 + 滞回**（超上限才裁、一次裁到下限），两次事件之间保持 append-only，否则每轮前缀都在变、缓存全失效。用响应 usage 的 `prompt_tokens` / `prompt_cache_hit_tokens` 观测命中率。
+
+**接缝分工。** `on_token`（逐 token 观察）、`on_step`（循环事件观察）、`Confirmer`（工具执行前批准 / 拒绝）都是「观察者」或「闸门」；`Callback` 是第一个**可变异**的接缝，所以是 async trait + `Result`。v1 不覆盖 GAIA 直答模式（它不走 `Completer`），也看不到轮次 / 阶段 / tools / `tool_choice`（留 v2）。参考实现见 `examples/callback_react.rs`（观察掩蔽 + 滑动窗口裁剪 + 动态注入 + 回复脱敏，离线可跑）。回调做持久化裁剪 / 摘要是**另一个机制**（管「存下来多少」），与本接缝（管「发出去多少」）互补。
