@@ -1,0 +1,11 @@
+{
+  "approval": {
+    "defaultAction": "allow",
+    "rules": [
+      { "pattern": "*__*", "action": "ask" },
+      { "pattern": "delete_files", "action": "ask" },
+      { "pattern": "edit_file", "action": "ask" },
+      { "pattern": "write_file", "action": "ask" }
+    ]
+  }
+}

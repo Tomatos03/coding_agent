@@ -1,8 +1,10 @@
-//! 端到端示例：用户提问 → ReAct 循环 → 调用 MCP 工具 → 汇总回答。
+//! 端到端示例：用户提问 → ReAct 循环 → 调用 MCP 工具（先被拒绝、后获批准）→ 汇总回答。
 //!
-//! 用脚本化的 `Completer` 代替真实 LLM，因此**无需任何凭证、可离线运行**：
-//! - 第 1 轮：模型请求调用 MCP 工具 `{server}__echo`；
-//! - 第 2 轮：模型根据工具观察调用 `final_answer` 收尾（循环内每轮 `tool_choice=required`）。
+//! 用脚本化的 `Completer` + `Confirmer` 代替真实 LLM 与人工确认，**无需任何凭证、可离线运行**：
+//! - 第 1 轮：模型请求调用 MCP 工具 `{server}__echo`，审批策略判 ask，脚本确认方**拒绝**；
+//!   拒绝被压成 Observation，循环不中断；
+//! - 第 2 轮：模型换参数重试，脚本确认方**批准**，工具真实执行；
+//! - 第 3 轮：模型根据工具观察调用 `final_answer` 收尾（循环内每轮 `tool_choice=required`）。
 //!
 //! 运行（需要本机 python3）：
 //!   cargo run --example mcp_react
@@ -16,10 +18,12 @@ use async_openai::types::chat::{
     FunctionCall,
 };
 use coding_agent::agent::llm::models::{Completer, Reply, ToolPolicy};
+use coding_agent::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
 use coding_agent::agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::agent::react::runner::ReactLoop;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
+use coding_agent::settings::{ApprovalAction, ApprovalPolicy, ApprovalRule};
 use coding_agent::tools::local::final_answer::FINAL_ANSWER_TOOL;
 use coding_agent::tools::mcp::{McpConfig, McpServerConfig};
 use coding_agent::tools::{ToolHashMap, build_tools_with};
@@ -71,13 +75,47 @@ impl Completer for ScriptedCompleter {
     }
 }
 
+/// 脚本化确认方：按预置队列依次给出决策，并打印每次询问（替代人工确认）。
+struct ScriptedConfirmer {
+    decisions: Mutex<VecDeque<Decision>>,
+}
+
+impl ScriptedConfirmer {
+    fn new(decisions: Vec<Decision>) -> Self {
+        Self {
+            decisions: Mutex::new(decisions.into()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Confirmer for ScriptedConfirmer {
+    async fn confirm(&self, request: &ApprovalRequest) -> Decision {
+        let decision = self
+            .decisions
+            .lock()
+            .expect("脚本锁被毒化")
+            .pop_front()
+            .expect("预置确认决策已用尽");
+        let label = match decision {
+            Decision::Approve => "批准",
+            Decision::Deny => "拒绝",
+        };
+        println!(
+            "[确认] 工具 `{}` 参数 {}（脚本决策：{label}）",
+            request.tool, request.arguments
+        );
+        decision
+    }
+}
+
 /// 构造一条「思考 + 调用某个工具」的回复。
-fn mcp_tool_call(tool_name: &str, arguments: &str) -> Reply {
+fn mcp_tool_call(id: &str, tool_name: &str, arguments: &str) -> Reply {
     Reply {
         content: "我先调用 MCP 的 echo 工具确认链路是否可用。".to_owned(),
         tool_calls: vec![ChatCompletionMessageToolCalls::Function(
             ChatCompletionMessageToolCall {
-                id: "call_mcp_1".to_owned(),
+                id: id.to_owned(),
                 function: FunctionCall {
                     name: tool_name.to_owned(),
                     arguments: arguments.to_owned(),
@@ -137,11 +175,14 @@ async fn main() -> anyhow::Result<()> {
 
     let user_question = "请调用 MCP 工具帮我确认链路是否可用。";
     let arguments = serde_json::json!({ "text": "hello from agent" }).to_string();
+    let retry_arguments = serde_json::json!({ "text": "hello again, after denial" }).to_string();
 
     let completer = ScriptedCompleter::new(vec![
-        // 第 1 轮：模型决定调用 MCP 工具。
-        mcp_tool_call(&echo_tool, &arguments),
-        // 第 2 轮：模型根据 Observation 调用 final_answer 收尾（required 下唯一的终止方式）。
+        // 第 1 轮：模型决定调用 MCP 工具，脚本确认方拒绝——拒绝被压成 Observation。
+        mcp_tool_call("call_mcp_1", &echo_tool, &arguments),
+        // 第 2 轮：模型换参数重试，脚本确认方批准，工具真实执行。
+        mcp_tool_call("call_mcp_2", &echo_tool, &retry_arguments),
+        // 第 3 轮：模型根据 Observation 调用 final_answer 收尾（required 下唯一的终止方式）。
         Reply {
             content: String::new(),
             tool_calls: vec![ChatCompletionMessageToolCalls::Function(
@@ -150,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
                     function: FunctionCall {
                         name: FINAL_ANSWER_TOOL.to_owned(),
                         arguments: serde_json::json!({
-                            "answer": "MCP 链路已打通：echo 工具成功返回了结果。"
+                            "answer": "MCP 链路已打通：第一次调用被拒绝，第二次获批准并成功返回。"
                         })
                         .to_string(),
                     },
@@ -159,8 +200,21 @@ async fn main() -> anyhow::Result<()> {
         },
     ]);
 
-    let mut agent = ReactLoop::new(Arc::new(completer), tools, SYSTEM_PROMPT, DEFAULT_MAX_TURNS)?;
+    // 审批策略：只对 MCP echo 工具判 ask（其余放行）；确认方脚本预置「先拒绝、后批准」。
+    let policy = ApprovalPolicy {
+        rules: vec![ApprovalRule {
+            pattern: echo_tool.clone(),
+            action: ApprovalAction::Ask,
+        }],
+        ..Default::default()
+    };
+    let confirmer = ScriptedConfirmer::new(vec![Decision::Deny, Decision::Approve]);
 
+    let mut agent = ReactLoop::new(Arc::new(completer), tools, SYSTEM_PROMPT, DEFAULT_MAX_TURNS)?
+        .with_approval_policy(policy)
+        .with_confirmer(Arc::new(confirmer));
+
+    println!("审批策略：`{echo_tool}` 需要人工确认（脚本决策：先拒绝、后批准）");
     println!("User: {user_question}\n");
 
     let outcome = agent

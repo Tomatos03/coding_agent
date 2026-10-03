@@ -9,7 +9,7 @@ src/
 ├── agent/
 │   ├── llm/          # LLM 客户端、provider 配置、并发信号量
 │   ├── rag/          # RAG 检索：embed / store / retriever（说明见 rag/README.md）
-│   └── react/        # ReAct 循环（runner/history/models）
+│   └── react/        # ReAct 循环（runner/history/models/approval）
 ├── tools/
 │   ├── tool.rs       # Tool trait
 │   ├── local/        # 本地（进程内）工具，每个工具一个子目录
@@ -19,6 +19,7 @@ src/
 │       ├── config.rs     # mcp.json 解析与校验
 │       ├── connection.rs # 启动子进程、握手、工具发现
 │       └── tool.rs       # 远端工具 -> 本地 Tool 适配
+├── settings.rs       # 危险工具审批策略（.agents/settings.json 的解析与匹配）
 ├── gaia/             # GAIA 数据集评测
 └── constant/         # 常量与 prompt
 examples/             # 可运行示例
@@ -122,6 +123,48 @@ cargo run --example edit_file
 cargo run --example delete_files
 ```
 
+## 危险工具确认（`.agents/settings.json`）
+
+ReAct 循环执行任何工具前会查一次审批策略：判 `ask` 的调用先经确认方征求同意，
+**拒绝被压成一条 Observation**——不执行、不中断循环，模型可按提示改用其它方案。
+工具层与传输层不感知这件事，判定完全由配置驱动（同一工具在交互终端与评测批处理里
+可以有不同待遇，改配置不需要改代码）。
+
+配置固定在**工作区根目录**（即进程当前目录）下的 `.agents/settings.json`（已 gitignore）：
+读取不到时使用默认配置（**全放行**，与没有这道闸门时行为一致）。仓库提交
+`.agents/settings.example.json` 作推荐配置：
+
+```json
+{
+  "approval": {
+    "defaultAction": "allow",
+    "rules": [
+      { "pattern": "*__*", "action": "ask" },
+      { "pattern": "write_file", "action": "ask" }
+    ]
+  }
+}
+```
+
+| 字段 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `defaultAction` | 否 | `"allow"` | 没有任何规则命中时的动作 |
+| `rules[].pattern` | 是 | — | 匹配工具暴露名（`filesystem__write_file`、`web_search`）；glob 风格，`*` 通配任意字符序列（含空）；空串报错 |
+| `rules[].action` | 是 | — | `"allow"` / `"ask"` |
+
+规则自上而下、**第一条命中即生效**；全名锚定、大小写敏感。`*__*` 恰好命中一切
+`{server}__{tool}` 形式的 MCP 工具。字段名拼错在启动时立即报错（`deny_unknown_fields`）。
+
+| 情况 | 行为 |
+|---|---|
+| `.agents/settings.json` 不存在 | 全放行，不报错 |
+| 策略判 `ask`、调用方注入了确认器 | 先征求同意再执行；被拒绝 → Observation，循环继续 |
+| 策略判 `ask`、但没有确认器（fail-closed） | 直接拒绝执行，同样压成 Observation |
+| `final_answer` 与撞上限的收尾轮 | 不执行工具，天然豁免闸门 |
+
+`examples/mcp_chat` 内置终端交互确认（stdin `y`/`n`）；`examples/mcp_react` 用脚本化
+确认方离线演示「先拒绝、后批准」，无需凭证。
+
 ## ReAct 循环：强制工具调用与 `final_answer`
 
 循环内每一轮都以 `tool_choice=required` 发请求，并显式打开 `parallel_tool_calls`。后者只是**请求**而不是契约：端点可以忽略它（DeepSeek 的参数表里没有这个字段），所以一轮多个 `tool_call` 会被当作正常输入处理。
@@ -148,8 +191,9 @@ cargo run --example delete_files
 ## 运行
 
 ```bash
-# 准备配置（mcp.json 已被 .gitignore 忽略）
+# 准备配置（mcp.json 与 .agents/settings.json 已被 .gitignore 忽略）
 cp mcp.example.json mcp.json
+cp .agents/settings.example.json .agents/settings.json   # 可选：启用危险工具确认
 
 # 常规构建与测试
 cargo build --all-targets

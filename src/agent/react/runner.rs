@@ -7,9 +7,11 @@ use async_openai::types::chat::{
 use tracing::info;
 
 use crate::agent::llm::models::{Completer, Reply, ToolPolicy};
+use crate::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
 use crate::agent::react::context::{Event, EventName, ExecuteContext, Role, Status};
 use crate::agent::react::history::History;
 use crate::agent::react::models::{Outcome, Step, Termination};
+use crate::settings::{ApprovalAction, ApprovalPolicy};
 use crate::tools::ToolHashMap;
 use crate::tools::local::final_answer::{self, FINAL_ANSWER_TOOL};
 
@@ -18,6 +20,8 @@ pub struct ReactLoop {
     tools: ToolHashMap,
     history: History,
     max_turns: usize,
+    approval_policy: ApprovalPolicy,
+    confirmer: Option<Arc<dyn Confirmer>>,
 }
 
 impl ReactLoop {
@@ -38,7 +42,24 @@ impl ReactLoop {
             tools,
             history,
             max_turns,
+            approval_policy: ApprovalPolicy::default(),
+            confirmer: None,
         })
+    }
+
+    /// 注入审批策略（通常来自 [`crate::settings::load_settings`]）。
+    ///
+    /// 不调用则全放行，行为与没有闸门时一致。加载是调用方的职责——
+    /// `ReactLoop` 自己不读文件，保持无 IO、可离线测试。
+    pub fn with_approval_policy(mut self, policy: ApprovalPolicy) -> Self {
+        self.approval_policy = policy;
+        self
+    }
+
+    /// 注入确认方。策略判 `ask` 而没有 confirmer 时，调用会被拒绝（fail-closed）。
+    pub fn with_confirmer(mut self, confirmer: Arc<dyn Confirmer>) -> Self {
+        self.confirmer = Some(confirmer);
+        self
     }
 
     pub fn history(&self) -> &[ChatCompletionRequestMessage] {
@@ -244,6 +265,37 @@ impl ReactLoop {
             func.arguments.clone(),
             Role::Assistant,
         ));
+
+        // 审批闸门：发完 Step::Action（模型确实做了这个动作）之后、execute 之前。
+        // 拒绝同样是一条 Observation，与「工具失败 / 未知工具」走完全相同的通道，
+        // 因此不变量①②照常成立，消费方也不用学新事件类型。
+        match self.approval_policy.action_for(&func.name) {
+            ApprovalAction::Allow => {}
+            ApprovalAction::Ask => {
+                let request = ApprovalRequest {
+                    turn,
+                    tool: func.name.clone(),
+                    description: self
+                        .tools
+                        .get(&func.name)
+                        .map(|tool| tool.description().to_owned())
+                        .unwrap_or_default(),
+                    arguments: func.arguments.clone(),
+                };
+                let decision = match &self.confirmer {
+                    Some(confirmer) => confirmer.confirm(&request).await,
+                    // 策略要问但无人可问 → fail-closed。
+                    None => Decision::Deny,
+                };
+                if let Decision::Deny = decision {
+                    tracing::warn!(tool = %func.name, "工具调用被用户拒绝");
+                    return format!(
+                        "用户拒绝执行工具 `{}`。请不要原样重试，先说明用途或改用其它方案。",
+                        func.name
+                    );
+                }
+            }
+        }
 
         self.execute(&func.name, &func.arguments).await
     }
@@ -487,6 +539,7 @@ fn observe(context: &ExecuteContext) {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+    use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -496,7 +549,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::agent::llm::models::{Reply, ToolPolicy};
+    use crate::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
     use crate::agent::react::models::DEFAULT_MAX_TURNS;
+    use crate::settings::{ApprovalAction, ApprovalPolicy, ApprovalRule};
     use crate::tools::local::final_answer::{FINAL_ANSWER_TOOL, FinalAnswer};
     use crate::tools::tool::Tool;
 
@@ -685,6 +740,58 @@ mod tests {
         }
     }
 
+    /// 脚本化确认方：按预置队列依次给出决策，同时记录调用次数与请求内容。
+    struct ScriptedConfirmer {
+        decisions: Mutex<VecDeque<Decision>>,
+        calls: AtomicUsize,
+        requests: Mutex<Vec<ApprovalRequest>>,
+    }
+
+    impl ScriptedConfirmer {
+        fn new(decisions: Vec<Decision>) -> Arc<Self> {
+            Arc::new(Self {
+                decisions: Mutex::new(decisions.into()),
+                calls: AtomicUsize::new(0),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::Relaxed)
+        }
+
+        fn requests(&self) -> Vec<ApprovalRequest> {
+            self.requests.lock().expect("锁被毒化").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Confirmer for ScriptedConfirmer {
+        async fn confirm(&self, request: &ApprovalRequest) -> Decision {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.requests
+                .lock()
+                .expect("锁被毒化")
+                .push(request.clone());
+            self.decisions
+                .lock()
+                .expect("锁被毒化")
+                .pop_front()
+                .expect("预置确认决策已用尽")
+        }
+    }
+
+    /// 自动批准：非交互场景（评测批处理等）的假实现样板——策略仍可决定要问哪些工具，
+    /// 但没人可问时不 fail-closed。放在测试里供拷贝，库本身不提供。
+    struct AutoApprove;
+
+    #[async_trait::async_trait]
+    impl Confirmer for AutoApprove {
+        async fn confirm(&self, _request: &ApprovalRequest) -> Decision {
+            Decision::Approve
+        }
+    }
+
     fn build(completer: Arc<dyn Completer>) -> ReactLoop {
         build_with_probe(completer, DEFAULT_MAX_TURNS).0
     }
@@ -713,6 +820,31 @@ mod tests {
         );
         let agent = ReactLoop::new(completer, tools, "你是测试助手。", max_turns)
             .expect("构造 ReactLoop 失败");
+        (agent, executed)
+    }
+
+    /// 只对匹配 `pattern` 的工具判 `ask` 的策略，其余全放行。
+    fn ask_for(pattern: &str) -> ApprovalPolicy {
+        ApprovalPolicy {
+            rules: vec![ApprovalRule {
+                pattern: pattern.to_owned(),
+                action: ApprovalAction::Ask,
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// 与 [`build_with_probe`] 相同，但注入审批策略与（可选的）确认方。
+    fn build_with_gate(
+        completer: Arc<dyn Completer>,
+        policy: ApprovalPolicy,
+        confirmer: Option<Arc<dyn Confirmer>>,
+    ) -> (ReactLoop, Arc<EchoProbe>) {
+        let (agent, executed) = build_with_probe(completer, DEFAULT_MAX_TURNS);
+        let mut agent = agent.with_approval_policy(policy);
+        if let Some(confirmer) = confirmer {
+            agent = agent.with_confirmer(confirmer);
+        }
         (agent, executed)
     }
 
@@ -1148,5 +1280,120 @@ mod tests {
                 .await,
             "输入即输出"
         );
+    }
+
+    #[tokio::test]
+    async fn denied_call_becomes_observation_and_loop_continues() {
+        let completer = ScriptedCompleter::new(vec![
+            calls_echo(r#"{"q":"hi"}"#),
+            calls_final_answer("被拒之后改口"),
+        ]);
+        let confirmer = ScriptedConfirmer::new(vec![Decision::Deny]);
+        let (mut agent, executed) =
+            build_with_gate(completer, ask_for("echo"), Some(confirmer.clone()));
+
+        let observed = RefCell::new(Vec::new());
+        let outcome = agent
+            .run(
+                "问题",
+                |step| observed.borrow_mut().push(step.clone()),
+                |_, _| {},
+            )
+            .await
+            .expect("拒绝不应中断循环");
+
+        assert_eq!(outcome.termination, Termination::FinalAnswer);
+        assert_eq!(outcome.answer, "被拒之后改口");
+        assert_eq!(executed.count(), 0, "被拒的调用不得执行");
+        assert_eq!(confirmer.call_count(), 1);
+        assert_eq!(
+            tool_messages(&agent),
+            2,
+            "被拒的调用同样要回填配对 tool 消息"
+        );
+        assert_eq!(
+            trace(&observed),
+            vec![(1, "action"), (1, "observation"), (2, "answer")],
+            "被拒是「尝试了、被拒了」：先 Action、后 Observation，无需新事件类型"
+        );
+
+        let denied = observed
+            .borrow()
+            .iter()
+            .find_map(|step| match step {
+                Step::Observation { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .expect("被拒的调用应产生一条 Observation");
+        assert!(denied.contains("拒绝"), "观察文案应讲明被拒：{denied}");
+
+        let requests = confirmer.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].turn, 1);
+        assert_eq!(requests[0].tool, "echo");
+        assert_eq!(
+            requests[0].description, "回显输入。参数里含 boom 时报错。",
+            "确认请求应带上工具的 description"
+        );
+    }
+
+    #[tokio::test]
+    async fn approved_call_executes_normally() {
+        let completer = ScriptedCompleter::new(vec![
+            calls_echo(r#"{"q":"hi"}"#),
+            calls_final_answer("答案"),
+        ]);
+        let (mut agent, executed) =
+            build_with_gate(completer, ask_for("echo"), Some(Arc::new(AutoApprove)));
+
+        let outcome = agent
+            .run("问题", |_| {}, |_, _| {})
+            .await
+            .expect("批准后应照常执行");
+
+        assert_eq!(outcome.termination, Termination::FinalAnswer);
+        assert_eq!(executed.count(), 1, "批准后照常执行");
+    }
+
+    #[tokio::test]
+    async fn ask_without_confirmer_is_denied() {
+        let completer = ScriptedCompleter::new(vec![
+            calls_echo(r#"{"q":"hi"}"#),
+            calls_final_answer("退而求其次"),
+        ]);
+        let (mut agent, executed) = build_with_gate(completer, ask_for("echo"), None);
+
+        let outcome = agent
+            .run("问题", |_| {}, |_, _| {})
+            .await
+            .expect("fail-closed 之后也应正常收尾");
+
+        assert_eq!(outcome.termination, Termination::FinalAnswer);
+        assert_eq!(executed.count(), 0, "策略要问但无人可问时不得执行");
+        assert_eq!(tool_messages(&agent), 2);
+    }
+
+    #[tokio::test]
+    async fn allow_policy_never_consults_confirmer() {
+        let completer = ScriptedCompleter::new(vec![
+            calls_echo(r#"{"q":"hi"}"#),
+            calls_final_answer("答案"),
+        ]);
+        // 策略全放行；confirmer 预置了拒绝决策——若被咨询，执行次数会变成 0。
+        let confirmer = ScriptedConfirmer::new(vec![Decision::Deny]);
+        let (mut agent, executed) = build_with_gate(
+            completer,
+            ApprovalPolicy::default(),
+            Some(confirmer.clone()),
+        );
+
+        let outcome = agent
+            .run("问题", |_| {}, |_, _| {})
+            .await
+            .expect("默认策略应全放行");
+
+        assert_eq!(outcome.termination, Termination::FinalAnswer);
+        assert_eq!(executed.count(), 1, "放行的调用照常执行");
+        assert_eq!(confirmer.call_count(), 0, "allow 不必咨询 confirmer");
     }
 }
