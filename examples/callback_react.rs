@@ -565,7 +565,7 @@ async fn main() -> anyhow::Result<()> {
     let outcome = agent
         .run(
             "请依次读取 a.rs、b.rs、c.rs 并总结。",
-            |step| match step {
+            &mut |step| match step {
                 Step::Thought { turn, content } => println!("[{turn}] 思考：{content}"),
                 Step::Answer { turn, content } => println!("\n[{turn}] 答案：{content}"),
                 Step::Action {
@@ -577,7 +577,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("[{turn}] {name} 返回 {} 字符", output.chars().count());
                 }
             },
-            |_, _| {},
+            &mut |_, _| {},
         )
         .await?;
 

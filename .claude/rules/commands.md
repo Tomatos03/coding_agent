@@ -4,7 +4,7 @@
 cargo build
 cargo run                          # bin: coding_agent —— History + LLMClient::complete 的单轮 demo（main.rs）
 cargo run --bin gaia               # GAIA Level 1 对比评测：每题各跑一次「带工具 / 不带工具」，输出两组通过数/通过率；需要 HF_TOKEN
-cargo run --example react_chat     # ReAct 主循环，逐轮打印 Thought / Answer / Action / Observation（非流式）
+cargo run --example react_chat     # 交互式会话 REPL：多轮对话 + /sessions /switch /delete /resume（需要 LLM 凭证）
 cargo run --example stream_chat    # 流式输出
 cargo run --example semaphore_chat # 并发限流：5 个任务抢 3 个 permit
 cargo run --example web_search     # 裸 HTTP 打 Tavily + 响应解析
@@ -22,9 +22,9 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 
 ## 测试
 
-**当前 235 个测试**：默认跑 231 个（全部离线，不联网、不需要凭证），另外 4 个是 `#[ignore]`：3 个 MCP 集成测试（需要本机 `python3`）+ 1 个 embedding 真实端点联测（需要 `EMBEDDING_*` 凭证）。下列按文件列举重点覆盖，非全部测试。
+**当前 263 个测试**：默认跑 259 个（全部离线，不联网、不需要凭证），另外 4 个是 `#[ignore]`：3 个 MCP 集成测试（需要本机 `python3`）+ 1 个 embedding 真实端点联测（需要 `EMBEDDING_*` 凭证）。下列按文件列举重点覆盖，非全部测试。
 
-`src/agent/react/runner.rs` 18 个，覆盖循环逻辑：
+`src/agent/react/runner.rs` 20 个，覆盖循环逻辑：
 
 - 调 `final_answer` → `Termination::FinalAnswer`，答案取 `execute` 的返回值，且该调用有配对 tool 消息
 - 纯文本回复（无 tool_calls）→ 端点无视了 `required`，降级为 `Termination::ModelFinished`；同时断言循环内收到的策略是 `Required`
@@ -42,6 +42,8 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 - **收尾轮发 `Step::Answer` 而非 `Thought`** → 断言完整事件序列 `[(1,action),(1,observation),(2,answer)]`
 - **中间轮的 content 发 `Step::Thought`** → 断言 `[(1,thought),(1,action),(1,observation),(2,answer)]`
 - 回调 `BeforeSend` 注入的消息到达传输层、但**不落 History** → 钉住「线上 ≠ 存档」
+- **审批挂起**：策略判 `ask` 且无人可答 → `Termination::Suspended` + `Outcome.pending`，历史停在未配对调用上（不发 tool 消息）
+- **恢复**：`resume(决定, turn)` 从半途批次继续，**已完成的调用不重跑**（按 tool 消息序列断言），且不重发已发出的 `Step::Action`；非挂起态调 `resume` 报错
 
 后两条用 `trace()` 辅助函数把 `Step` 压成 `(轮次, 类型)` 序列做整体比对——比逐个 `assert!(matches!(...))` 更能钉住**顺序**，而这两条的核心正是发射顺序。
 
@@ -55,6 +57,8 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 
 `src/agent/llm/callback.rs` 8 个（全部离线；假内层传输层记录收到的消息并返回预置 `Reply`，假回调按事件记录轨迹）：`BeforeSend` 注入的消息送达内层；`AfterSend` 改写的 `Reply` 出现在返回值里；空回调列表 = 透传；洋葱顺序 `[outer:before, inner:before, inner:after, outer:after]` 且两层互相可见对方的改动；`BeforeSend` 报错时整个请求中止且内层**未被调用**（fail-closed）；`AfterSend` 报错即便回复已到手也传播；只处理 `BeforeSend` 的放行模板照常参与全链（两个事件都会送达）；stream 路径同样派发两种事件且 `on_token` 直通不受影响。
 
+Session 相关 22 个（全部离线）：`src/agent/session/models.rs` 4 个（标题按字符截断 / `pending_call` 从历史推导的四种形态 / 摘要带挂起标记 / serde round-trip）；`src/agent/session/manager.rs` 11 个（create 唯一且只含 system、get/delete 的缺失语义、list 过滤与排序、多轮累积历史、**挂起并写 `state.turn`**、resume 批准恰好执行一次、resume 拒绝压成 Observation、挂起态 `send` 与非挂起态 `resume` 都报错、**同会话并发串行不丢消息**、**不同会话互不阻塞**（用 Notify 门控证明）、**挂起无限期可恢复**）；`src/agent/runtime.rs` 7 个（`default_user` 落到会话、builder 默认全放行、`Agent` 委派与 manager 一致；**`Agent::run` 的循环**：首次追问自动建会话并报答案、斜杠命令分发与 `/quit` 收尾、挂起提示 + `/resume y` 继续、单轮出错只打印并继续——脚本化 `Console` 驱动，不碰真实终端）。
+
 `src/tools/local/final_answer/mod.rs` 5 个：`execute` 把输入参数原样返回、可重复调用（纯函数）、`extract_answer` 容忍首尾空白、拒绝非法 JSON / 缺字段 / 空串、`execute` 传播解析错误。
 
 MCP 相关共 32 个：
@@ -62,7 +66,7 @@ MCP 相关共 32 个：
 - `src/tools/mcp/config.rs` 10 个：配置解析、默认值、非法字段/名字/超时拒绝、缺文件回退
 - `src/tools/mcp/tool.rs` 14 个（1 个 ignored）：结果映射、参数解析、命名校验、适配器端到端调用
 - `src/tools/mcp/connection.rs` 5 个（1 个 ignored）：`Send + Sync`、空配置、失败隔离、真实 server 工具发现
-- `src/tools/mod.rs` 3 个（1 个 ignored）：重名去重、空配置含 `web_search` + `final_answer` 两个本地工具、连接在注册后仍存活
+- `src/tools/mod.rs` 4 个（1 个 ignored）：重名去重、空配置含 `web_search` + `final_answer` 两个本地工具、连接在注册后仍存活、**每个工具的 definition 都必须是顶层 `type: "object"` 的 schema**（防 `edit_file` 那类 400 回潮）。
 
 GAIA 相关 11 个（全部离线）：`src/gaia/solver.rs` 6 个（严格 JSON / 代码块与正文包裹 / 字符串内花括号 / 纯文本兜底 / 空内容报错 / 无平衡对象），`src/gaia/report.rs` 2 个（按模型×模式汇总、通过率边界），`src/gaia/evaluator.rs` 2 个（脚本化 `Completer` 跑通带工具的 ReAct 路径并统计工具调用次数；**`final_answer` 不计入工具调用**），`src/gaia/models.rs` 1 个（`schemars` 的 `deny_unknown_fields` 只作用于 JSON Schema，serde 侧仍忽略未知字段）。
 

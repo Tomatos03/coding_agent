@@ -86,7 +86,7 @@ async fn execute(&self, name: &str, arguments: &str) -> String
 
 `src/tools/local/final_answer/mod.rs` 的 `execute` **输入即输出**：解析 `answer` 参数后原样返回。于是循环用统一的 `action → execute → Observation` 路径就能拿到最终答案，每个 `tool_call` 也天然有配对 tool 消息（不变量②）。循环的终止判据是「参数可解析」（`extract_answer`），交付值取 `execute` 的返回值——两者同源、必然一致。**若改成「在 `execute` 之前拦截、跳过执行」，同轮其它 `tool_call` 就会失去配对 tool 消息。** `extract_answer` / `execute` 必须是纯函数：给这个工具加副作用会破坏「可安全重复调用」这条隐含约定。
 
-**审批闸门（危险工具确认）在 `action()` 里、`Step::Action` 之后、`execute()` 之前。** `ReactLoop` 持有 `approval_policy`（来自工作区根目录的 `.agents/settings.json`，经 `src/settings.rs` 的 `load_settings()` 加载；缺文件 = 全默认 = 全放行）与可选 `confirmer`（`src/agent/react/approval.rs` 的 `Confirmer` trait）。`action_for(name)` 判 `ask` 时经 `Confirmer` 拿决定，**拒绝被压成一条 Observation**（「用户拒绝执行工具…」）——它不是 `Err`、也不是 `execute` 之前的特例分支，而是与「工具失败 / 未知工具」完全相同的通道，不变量①②原样成立，消费方不用学新事件类型。两个静默陷阱：**(a)** 策略判 `ask` 但调用方未注入 `confirmer` 时**拒绝执行**（fail-closed）——非交互场景要么把该工具配成 `allow`，要么显式注入自动批准的实现；**(b)** 匹配只按**暴露名**做 glob（`*` 通配任意字符序列；`*__*` 恰命中一切 MCP 工具），参数级粒度（rm 拦、ls 放行）留给 `Confirmer` 自己看 `arguments`。豁免路径无需特判：`final_answer` 的交付路径与 `finalize()` 都不执行工具，结构上到不了闸门。`ReactLoop` 只收算好的 `ApprovalPolicy` / `Confirmer` 对象，自己不读文件——与「收 `ToolHashMap` 而不跑 `build_tools()`」同一条原则；配置启动时读一次，改完重启生效（与 `mcp.json` 一致）。
+**审批闸门（危险工具确认）在 `run_pending_calls()` 里、`Step::Action` 之后、`execute()` 之前。** `ReactLoop` 持有 `approval_policy`（来自工作区根目录的 `.agents/settings.json`，经 `src/settings.rs` 的 `load_settings()` 加载；缺文件 = 全默认 = 全放行）与可选 `confirmer`（`src/agent/react/approval.rs` 的 `Confirmer` trait）。`action_for(name)` 判 `ask` 时经 `Confirmer` 拿决定：**拒绝被压成一条 Observation**（「用户拒绝执行工具…」）——它不是 `Err`、也不是 `execute` 之前的特例分支，而是与「工具失败 / 未知工具」完全相同的通道，不变量①②原样成立，消费方不用学新事件类型。两条静默陷阱：**(a)** 策略判 `ask` 但调用方未注入 `confirmer` 时**挂起**（`Termination::Suspended`），不再 fail-closed 直接拒绝——会话停在未执行完的工具批次上，等 session 层带决定 `resume`（`Confirmer` 主动返回 `Decision::Pending` 走同一条路；这是行为变更，详见第 11 节）；**(b)** 匹配只按**暴露名**做 glob（`*` 通配任意字符序列；`*__*` 恰命中一切 MCP 工具），参数级粒度（rm 拦、ls 放行）留给 `Confirmer` 自己看 `arguments`。豁免路径无需特判：`final_answer` 的交付路径与 `finalize()` 都不执行工具，结构上到不了闸门。`ReactLoop` 只收算好的 `ApprovalPolicy` / `Confirmer` 对象，自己不读文件——与「收 `ToolHashMap` 而不跑 `build_tools()`」同一条原则；配置启动时读一次，改完重启生效（与 `mcp.json` 一致）。
 
 **循环内每轮都是 `tool_choice=required`。** 服务端保证回复里至少有一个 `tool_call`，所以模型**只能**靠 `final_answer` 结束，`content` 永远只是 thought。两条降级路径兜底：(a) 回复里没有 `tool_calls` → 端点无视了强制，把 `content` 当答案收尾（`Termination::ModelFinished`）；(b) 端点以 400 明确拒绝 `tool_choice` → `LLMClient` 置粘性标记（`AtomicBool`）、改用 `Auto` 重发一次，此后所有请求都不再强制。`ToolPolicy`（`Auto` / `Required` / `Force(name)`）是请求级参数，随每轮传入 `Completer`，不能写进 messages。
 
@@ -199,3 +199,50 @@ pub struct ChatCompletionStreamResponseDelta {
 **前缀缓存约束（`BeforeSend` 的核心）。** 主流 provider 对 prompt 的**最长公共 token 前缀**做 KV 缓存，从第一个 token 起精确匹配：注入要**拼在尾部**（插开头 / 中间会让插入点之后全部 miss）；裁剪 / 掩蔽要**攒批 + 滞回**（超上限才裁、一次裁到下限），两次事件之间保持 append-only，否则每轮前缀都在变、缓存全失效。用响应 usage 的 `prompt_tokens` / `prompt_cache_hit_tokens` 观测命中率。
 
 **接缝分工。** `on_token`（逐 token 观察）、`on_step`（循环事件观察）、`Confirmer`（工具执行前批准 / 拒绝）都是「观察者」或「闸门」；`Callback` 是第一个**可变异**的接缝，所以是 async trait + `Result`。v1 不覆盖 GAIA 直答模式（它不走 `Completer`），也看不到轮次 / 阶段 / tools / `tool_choice`（留 v2）。参考实现见 `examples/callback_react.rs`（观察掩蔽 + 滑动窗口裁剪 + 动态注入 + 回复脱敏，离线可跑）。回调做持久化裁剪 / 摘要是**另一个机制**（管「存下来多少」），与本接缝（管「发出去多少」）互补。
+
+## 11. Session 机制（多轮会话 / 多会话管理 / 审批挂起）
+
+`src/agent/session/` 与 `src/agent/runtime.rs` 把「一次 run」升级成「一段可管理的会话」。组件关系：
+
+```
+Agent（runtime.rs：组装配置 + 委派）
+  └── SessionManager（session/manager.rs：会话注册表）
+        └── 每个 session 一个长期存活的 ReactLoop（多轮）
+```
+
+- **`Session`**（`session/models.rs`）就是你定的 schema：`session_id` / `user_id` / `history` / `state` / `created_at` / `updated_at`。**不额外存状态字段**：标题、消息数、挂起态全部从 `history` 派生（`title()` / `summary()` / `pending_call()`），schema 因此保持不动。`session/history` 的类型是 `Vec<ChatCompletionRequestMessage>`。
+- **历史即检查点。** 挂起时不写任何额外数据——`run_pending_calls` 遇到 `Decision::Pending`（或无人可答）就原地返回，历史停在「assistant(tool_calls) + 前 k 条配对 tool 消息」上。恢复游标由纯函数 `history::pending_batch()` 反推（数最后一条带 `tool_calls` 的 assistant 后面跟了几条 tool 消息）。正常结束的 run 绝不留下未配对调用（不变量②），所以「有未配对调用 ⇔ 挂起」是充要条件。
+- **`turn` 必须落在 `state` 里**：历史里没有轮次号，而恢复位置与 `max_turns` 预算都靠它。保留键 `turn` / `pause` 由 manager 维护，`pause` 只是展示副本。挂起**无限期**：没有超时、不自动批准/拒绝，只有显式 `resume` 才推进；`SessionSummary` 的 `suspended` / `pending_tool` 让它可见，`resume` 按 id 寻址所以随时可以回来批。
+- **loop 是活体、`history` 是快照。** `SessionEntry { session, engine }` 把数据与执行者放在一起；每次 `send` / `resume` 收尾（含挂起）把 `engine.history()` 回写 `session.history`、刷新 `updated_at`。v2 文件后端冷启动时用 `ReactLoop::from_history()` 反向重建——**快照就是恢复源**。
+- **并发**：外层 `std::sync::RwLock` 只做查表（临界区**绝不跨 await**），每个会话一把 `tokio::sync::Mutex` 在整轮 run 期间持有 → 同一 session 串行排队、不同 session 互不阻塞。写回因此不需要 CAS。
+- **`create` 时即写入 system prompt**，所以不存在「空历史」的会话；之后一律以历史里的 system 为准（历史即事实），换 prompt 不会追溯升级既有会话。
+- **本轮边界**：内存实现，退出即丢；跨重启保留要等文件后端（那时更可能把持久化拆成 `SessionStore` 挂在 manager 内部，而不是写一个把 loop 管理复制一遍的 `FileSessionManager`）。
+- **交互式循环住在 `Agent::run`**：读入 →（斜杠命令 | 追问）→ 驱动一轮 → 展示，直到输入结束或 `/quit`；当前会话（首次追问自动新建、`/new` `/switch` `/delete` 改它）由循环自己维护。I/O 通过 `Console` trait 挡在库外（`read_line` / `print` / `step`），`Agent` 因此仍是无隐式 IO 的库组件——示例接 stdin，测试接脚本化输入。单轮出错（网络、挂起态被追问……）只打印一行 `[错误]` 并继续循环；流式 token 暂不投递（`step` 已交付完整答案，同时投递会打印两遍）。
+
+**HRTB 陷阱（改 `ReactLoop` 回调签名前必读）。** `ReactLoop::run` / `resume` 的回调参数**只能**是 `&mut (dyn for<'x> FnMut(&'x Step) + Send)`——不能是泛型 `impl FnMut(&Step)`。原因：session 层持有的是 trait object，而 `impl FnMut(&Step)` 与 `&mut dyn FnMut(&Step)` 之间隔着 `impl FnMut for &mut F` 这条泛型实现，编译器无法为它推出 `for<'a>` 绑定（报 `FnMut is not general enough` / `borrowed data escapes outside of closure`），连用闭包手工适配 `|step| on_step(step)` 也一样。所以只有一套入口，调用方传闭包时写 `&mut |..|`（回调必须 `Send`）。另外 `async_trait` 展开后会丢掉高阶绑定，`for<'x>` 必须显式写。
+
+**影响面**：老路径（`ReactLoop::new` + `run`）行为不变，GAIA / `main.rs` / `mcp_chat` 逻辑不受影响；但 `run` / `resume` 的签名变了——所有调用点写 `&mut |..|`，且 `on_step` 要求 `Send`（原先不要求，测试里拿 `RefCell` 收集 `Step` 的写法已改 `Mutex`）。
+
+## 12. 工具 schema 归一化（`utils::schema`）
+
+`Tool::definition()` 是工具定义发往服务端的**唯一出口**，它会对 `parameters()` 做一次
+`utils::schema::flatten_tagged_union`，因为 `schemars` 对「内部标签枚举」只会生成顶层 `oneOf`：
+
+```rust
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum EditFileArgs { StrReplace { .. }, Insert { .. }, ReplaceAnchor { .. } }
+// schema_for! 得到：{ "oneOf": [ {..}, {..}, {..} ], "title": "EditFileArgs" }
+```
+
+而 OpenAI 要求 function parameters 顶层是 `type: "object"`，否则整个请求 400（不是这一个工具被跳过，是**整轮**失败）：
+
+```text
+400 Bad Request invalid_request_error: Invalid schema for function 'edit_file':
+schema must be a JSON Schema of 'type: "object"', got 'type: null'.
+```
+
+压平规则（`src/utils/schema.rs` 的 doc 有完整版）：`properties` 取并集；同名属性两边都是 `const`/`enum` 时合并成取值枚举；`required` 取**交集**（只在部分分支必填的字段降级为可选，缺字段由运行期反序列化报错、再压成 Observation 让模型自纠）。**保守**：仅当每个分支都是带 `properties` 的 object 时才动手，否则原样放行。
+
+同一个出口还会收敛 `Option<T>` 带来的 `"type": ["X", "null"]`（`schemars` 的产物）：这些字段本来就不在 `required` 里，模型完全可以省略，而 OpenAI 对 union type 支持不稳。收敛不改变运行期行为——`Option<T>` 对「缺字段」与「显式 null」都能反序列化；只有「去掉 `null` 后恰好剩一个类型」时才改，多类型联合原样保留。
+
+这是编译期宏产物，本地测试看不见——`tools::tests::every_tool_definition_is_a_top_level_object_schema` 钉住了实际发出去的形状。新增工具时不要绕过 `definition()` 直接拼 `FunctionObject`；MCP 工具的服务端 schema 也走同一条路。

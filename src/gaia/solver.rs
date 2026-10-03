@@ -74,7 +74,7 @@ pub async fn solve_gaia_question_with_tools(
     let outcome = agent
         .run(
             prompt,
-            |step| {
+            &mut |step| {
                 // `final_answer` 是收尾动作，不是真正的工具使用，不能算进
                 // 「带工具这一组是否真的用上了工具」的口径里。
                 if let Step::Action { name, .. } = step
@@ -83,7 +83,7 @@ pub async fn solve_gaia_question_with_tools(
                     tool_calls += 1;
                 }
             },
-            |_, _| {},
+            &mut |_, _| {},
         )
         .await?;
 

@@ -1,5 +1,12 @@
 pub const DEFAULT_MAX_TURNS: usize = 12;
 
+/// 一次「停在半途」的审批：`tool_call_id` 用于在恢复时定位到批次里的那一个调用。
+#[derive(Debug, Clone)]
+pub struct PendingApproval {
+    pub tool_call_id: String,
+    pub request: crate::agent::react::approval::ApprovalRequest,
+}
+
 #[derive(Debug, Clone)]
 pub enum Step {
     Thought {
@@ -33,6 +40,9 @@ pub enum Termination {
     MaxTurns,
     /// 模型既没有 tool_calls 也没有内容。
     EmptyReply,
+    /// 审批挂起：本次 run 正常结束，但会话停在未执行完的工具批次上，
+    /// 待审内容见 `Outcome.pending`，由调用方 `ReactLoop::resume` 带决定继续。
+    Suspended,
 }
 
 #[derive(Debug)]
@@ -40,4 +50,6 @@ pub struct Outcome {
     pub answer: String,
     pub turns: usize,
     pub termination: Termination,
+    /// 仅 `Termination::Suspended` 时非 `None`：等待决定的那个工具调用。
+    pub pending: Option<PendingApproval>,
 }

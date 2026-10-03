@@ -169,6 +169,53 @@ mod tests {
         }
     }
 
+    /// OpenAI 要求 function parameters 的顶层是 `type: "object"`。
+    ///
+    /// `schemars` 对「内部标签枚举」（`#[serde(tag = "command")]`）只会生成顶层
+    /// `oneOf`，服务端以 400 `Invalid schema ... got 'type: null'` 拒绕——`edit_file`
+    /// 踩过这个坑。`Tool::definition()` 会在唯一出口处压平（见 `utils::schema`），
+    /// 这里钉住**实际发出去的形状**。
+    #[tokio::test]
+    async fn every_tool_definition_is_a_top_level_object_schema() {
+        let registry = build_tools_with(McpConfig::default())
+            .await
+            .expect("空配置应成功");
+
+        for (name, tool) in &registry {
+            let definition = serde_json::to_value(tool.definition().expect("definition 构造失败"))
+                .expect("definition 序列化失败");
+            let parameters = &definition["function"]["parameters"];
+
+            assert_eq!(
+                parameters["type"], "object",
+                "工具 `{name}` 的参数 schema 顶层必须是 object，实际为：\n{parameters}"
+            );
+            assert!(
+                parameters["properties"].is_object(),
+                "工具 `{name}` 的参数 schema 应有 properties：\n{parameters}"
+            );
+            assert!(
+                !has_nullable_type(parameters),
+                "工具 `{name}` 的参数 schema 不应出现含 null 的 type 联合：\n{parameters}"
+            );
+        }
+    }
+
+    /// 递归找 `"type": [.., "null"]`。
+    fn has_nullable_type(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(map) => {
+                let nullable = map
+                    .get("type")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("null")));
+                nullable || map.values().any(has_nullable_type)
+            }
+            serde_json::Value::Array(items) => items.iter().any(has_nullable_type),
+            _ => false,
+        }
+    }
+
     #[tokio::test]
     #[ignore = "需要本机 python3；手动运行 cargo test -- --ignored"]
     async fn registry_keeps_mcp_connection_alive() {

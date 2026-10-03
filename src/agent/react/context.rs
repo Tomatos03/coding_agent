@@ -9,6 +9,8 @@ pub enum Status {
     Running,
     Completed,
     Failed,
+    /// 审批挂起：本次 run 正常结束，但会话停在半途，等 `resume` 继续。
+    Suspended,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

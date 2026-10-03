@@ -18,9 +18,13 @@ pub struct ApprovalRequest {
 pub enum Decision {
     Approve,
     Deny,
+    /// 「我现在不决定」：循环**挂起**本次 run（`Termination::Suspended`），
+    /// 历史停在未配对的 `tool_call` 上，等调用方带决定 `resume`。
+    Pending,
 }
 
-/// 问谁、怎么问、要不要记住，都由实现决定。循环只等一个 [`Decision`]。
+/// 问谁、怎么问、要不要记住，都由实现决定。循环只等一个 [`Decision`]；
+/// 没有注入 confirmer 时，策略判 `ask` 的调用会被挂起（而非拒绝）。
 #[async_trait::async_trait]
 pub trait Confirmer: Send + Sync {
     async fn confirm(&self, request: &ApprovalRequest) -> Decision;

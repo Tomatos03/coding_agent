@@ -2,15 +2,14 @@ use std::sync::Arc;
 
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
-    FunctionCall,
 };
 use tracing::info;
 
 use crate::agent::llm::models::{Completer, Reply, ToolPolicy};
 use crate::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
 use crate::agent::react::context::{Event, EventName, ExecuteContext, Role, Status};
-use crate::agent::react::history::History;
-use crate::agent::react::models::{Outcome, Step, Termination};
+use crate::agent::react::history::{History, pending_batch};
+use crate::agent::react::models::{Outcome, PendingApproval, Step, Termination};
 use crate::settings::{ApprovalAction, ApprovalPolicy};
 use crate::tools::ToolHashMap;
 use crate::tools::local::final_answer::{self, FINAL_ANSWER_TOOL};
@@ -36,7 +35,18 @@ impl ReactLoop {
     ) -> anyhow::Result<Self> {
         let mut history = History::new();
         history.system(system_prompt)?;
+        Self::from_history(history, completer, tools, max_turns)
+    }
 
+    /// 带着既有历史构造（[`Self::new`] 是它的特例：历史里只有 system）。
+    ///
+    /// session 层用它恢复冷会话：**历史即事实**，system prompt 也以历史里的为准。
+    pub fn from_history(
+        history: History,
+        completer: Arc<dyn Completer>,
+        tools: ToolHashMap,
+        max_turns: usize,
+    ) -> anyhow::Result<Self> {
         Ok(Self {
             completer,
             tools,
@@ -56,7 +66,8 @@ impl ReactLoop {
         self
     }
 
-    /// 注入确认方。策略判 `ask` 而没有 confirmer 时，调用会被拒绝（fail-closed）。
+    /// 注入确认方。策略判 `ask` 而没有 confirmer 时，该调用会被**挂起**
+    /// （`Termination::Suspended`），而不是旧版的直接拒绝。
     pub fn with_confirmer(mut self, confirmer: Arc<dyn Confirmer>) -> Self {
         self.confirmer = Some(confirmer);
         self
@@ -66,32 +77,92 @@ impl ReactLoop {
         self.history.as_slice()
     }
 
+    /// 跑一轮：先追加 user 消息，然后驱动循环直到交付 / 挂起。
+    ///
+    /// 回调收 `&mut dyn`（而不是 `impl FnMut`）是**唯一可行**的写法：
+    /// `impl FnMut(&Step)` 与 `&mut dyn FnMut(&Step)` 之间隔着
+    /// `impl FnMut for &mut F` 这条泛型实现，编译器无法为它推出 `for<'a>` 约束
+    /// （报 `FnMut is not general enough`），所以不能两者兼收；而 session 层
+    /// 持有的是 trait object，只能选 dyn。调用方传闭包时写 `&mut |..|` 即可。
+    ///
+    /// 另外 `async_trait` 展开后会丢掉高阶绑定，因此这里的 `for<'x>` 必须显式写出。
     pub async fn run(
         &mut self,
         prompt: &str,
-        mut on_step: impl FnMut(&Step),
-        mut on_token: impl FnMut(usize, &str) + Send,
+        on_step: &mut (dyn for<'x> FnMut(&'x Step) + Send),
+        on_token: &mut (dyn for<'x> FnMut(usize, &'x str) + Send),
+    ) -> anyhow::Result<Outcome> {
+        self.history.user(prompt)?;
+
+        let mut context = ExecuteContext::new();
+        let outcome = self.drive(1, None, &mut context, on_step, on_token).await;
+
+        info!("actual execute turns: {}", context.turn());
+        outcome
+    }
+
+    /// 从挂起处继续：`turn` 是挂起时所在轮次（session 层从 `state["turn"]` 取）。
+    ///
+    /// 先跑完那个未完成批次里剩下的调用（`decision` 只作用于批次里第一个待执行的调用），
+    /// 再从下一轮继续。历史里没有未配对调用时报错。
+    pub async fn resume(
+        &mut self,
+        decision: Decision,
+        turn: usize,
+        on_step: &mut (dyn for<'x> FnMut(&'x Step) + Send),
+        on_token: &mut (dyn for<'x> FnMut(usize, &'x str) + Send),
     ) -> anyhow::Result<Outcome> {
         let mut context = ExecuteContext::new();
-
         let outcome = self
-            .run_loop(prompt, &mut context, &mut on_step, &mut on_token)
+            .drive(turn, Some(decision), &mut context, on_step, on_token)
             .await;
 
         info!("actual execute turns: {}", context.turn());
         outcome
     }
 
-    async fn run_loop(
+    /// 两个入口共用的驱动逻辑：`resume` 为 `Some` 时先补完挂起批次，
+    /// 再从 `start_turn + 1` 继续；否则直接从 `start_turn` 开始。
+    async fn drive(
         &mut self,
-        prompt: &str,
+        start_turn: usize,
+        resume: Option<Decision>,
         context: &mut ExecuteContext,
-        on_step: &mut impl FnMut(&Step),
-        on_token: &mut (impl FnMut(usize, &str) + Send),
+        on_step: &mut (dyn for<'x> FnMut(&'x Step) + Send),
+        on_token: &mut (dyn for<'x> FnMut(usize, &'x str) + Send),
     ) -> anyhow::Result<Outcome> {
-        self.history.user(prompt)?;
+        if let Some(decision) = resume {
+            let batch = pending_batch(self.history.as_slice()).ok_or_else(|| {
+                anyhow::anyhow!("会话不处于挂起状态：历史里没有未配对的 tool_call")
+            })?;
 
-        for turn in 1..=self.max_turns {
+            context.set_turn(start_turn);
+            let pending = self
+                .run_pending_calls(
+                    &batch.calls,
+                    batch.next,
+                    Some(decision),
+                    start_turn,
+                    context,
+                    on_step,
+                )
+                .await?;
+
+            observe(context);
+
+            if let Some(pending) = pending {
+                context.set_status(Status::Suspended);
+                return Ok(suspended(start_turn, pending));
+            }
+        }
+
+        let first = if resume.is_some() {
+            start_turn + 1
+        } else {
+            start_turn
+        };
+
+        for turn in first..=self.max_turns {
             context.set_turn(turn);
 
             let progressed = self
@@ -101,7 +172,11 @@ impl ReactLoop {
             observe(context);
 
             if let Some(outcome) = progressed? {
-                context.set_status(Status::Completed);
+                context.set_status(if outcome.termination == Termination::Suspended {
+                    Status::Suspended
+                } else {
+                    Status::Completed
+                });
                 return Ok(outcome);
             }
         }
@@ -112,6 +187,7 @@ impl ReactLoop {
             answer,
             turns: self.max_turns,
             termination: Termination::MaxTurns,
+            pending: None,
         })
     }
 
@@ -119,8 +195,8 @@ impl ReactLoop {
         &mut self,
         turn: usize,
         context: &mut ExecuteContext,
-        on_step: &mut impl FnMut(&Step),
-        on_token: &mut (impl FnMut(usize, &str) + Send),
+        on_step: &mut (dyn for<'x> FnMut(&'x Step) + Send),
+        on_token: &mut (dyn for<'x> FnMut(usize, &'x str) + Send),
     ) -> anyhow::Result<Option<Outcome>> {
         let Reply {
             content,
@@ -142,6 +218,7 @@ impl ReactLoop {
                     answer: content,
                     turns: turn,
                     termination: Termination::EmptyReply,
+                    pending: None,
                 }));
             }
 
@@ -172,16 +249,11 @@ impl ReactLoop {
             ));
         }
 
-        for call in &calls {
-            // `function_calls` 已保证只剩 Function 变体。
-            let ChatCompletionMessageToolCalls::Function(func_call) = call else {
-                continue;
-            };
-
-            let observation = self
-                .action(&func_call.function, turn, context, on_step)
-                .await;
-            self.on_observation(func_call, observation, turn, context, on_step)?;
+        if let Some(pending) = self
+            .run_pending_calls(&calls, 0, None, turn, context, on_step)
+            .await?
+        {
+            return Ok(Some(suspended(turn, pending)));
         }
 
         Ok(None)
@@ -193,7 +265,7 @@ impl ReactLoop {
         observation: String,
         turn: usize,
         context: &mut ExecuteContext,
-        on_step: &mut impl FnMut(&Step),
+        on_step: &mut (dyn for<'x> FnMut(&'x Step) + Send),
     ) -> anyhow::Result<()> {
         on_step(&Step::Observation {
             turn,
@@ -248,64 +320,111 @@ impl ReactLoop {
         Ok(())
     }
 
-    async fn action(
+    /// 执行一个 assistant 批次中从 `start` 起的剩余调用。
+    ///
+    /// - `resumed = Some(decision)`：`start` 处是恢复出来的调用——不再重复发
+    ///   `Step::Action`（挂起前已发过），并直接采用该决定；
+    /// - 返回 `Some(PendingApproval)` 表示在此处**挂起**：该调用不写 tool 消息，
+    ///   历史停在「assistant(tool_calls) + 前 k 条配对 tool 消息」上，即恢复点。
+    async fn run_pending_calls(
         &mut self,
-        func: &FunctionCall,
+        calls: &[ChatCompletionMessageToolCalls],
+        start: usize,
+        resumed: Option<Decision>,
         turn: usize,
         context: &mut ExecuteContext,
-        on_step: &mut impl FnMut(&Step),
-    ) -> String {
-        on_step(&Step::Action {
-            turn,
-            name: func.name.clone(),
-            arguments: func.arguments.clone(),
-        });
-        context.push_event(Event::new(
-            EventName::ToolCall,
-            func.arguments.clone(),
-            Role::Assistant,
-        ));
+        on_step: &mut (dyn for<'x> FnMut(&'x Step) + Send),
+    ) -> anyhow::Result<Option<PendingApproval>> {
+        for (offset, call) in calls.iter().enumerate().skip(start) {
+            // `function_calls` 已保证只剩 Function 变体。
+            let ChatCompletionMessageToolCalls::Function(func) = call else {
+                continue;
+            };
+            let is_resumed_head = offset == start && resumed.is_some();
 
-        // 审批闸门：发完 Step::Action（模型确实做了这个动作）之后、execute 之前。
-        // 拒绝同样是一条 Observation，与「工具失败 / 未知工具」走完全相同的通道，
-        // 因此不变量①②照常成立，消费方也不用学新事件类型。
-        match self.approval_policy.action_for(&func.name) {
-            ApprovalAction::Allow => {}
-            ApprovalAction::Ask => {
-                let request = ApprovalRequest {
+            // 审批闸门：发完 Step::Action（模型确实做了这个动作）之后、execute 之前。
+            // 拒绝同样是一条 Observation，与「工具失败 / 未知工具」走完全相同的通道，
+            // 因此不变量①②照常成立，消费方也不用学新事件类型。
+            if !is_resumed_head {
+                on_step(&Step::Action {
                     turn,
-                    tool: func.name.clone(),
-                    description: self
-                        .tools
-                        .get(&func.name)
-                        .map(|tool| tool.description().to_owned())
-                        .unwrap_or_default(),
-                    arguments: func.arguments.clone(),
-                };
-                let decision = match &self.confirmer {
-                    Some(confirmer) => confirmer.confirm(&request).await,
-                    // 策略要问但无人可问 → fail-closed。
-                    None => Decision::Deny,
-                };
-                if let Decision::Deny = decision {
-                    tracing::warn!(tool = %func.name, "工具调用被用户拒绝");
-                    return format!(
+                    name: func.function.name.clone(),
+                    arguments: func.function.arguments.clone(),
+                });
+                context.push_event(Event::new(
+                    EventName::ToolCall,
+                    func.function.arguments.clone(),
+                    Role::Assistant,
+                ));
+            }
+
+            // `Some(..)`：这个调用有决定；`None`：没人能决定 → 挂起。
+            let decision = match if is_resumed_head { resumed } else { None } {
+                Some(decision) => Some(decision),
+                None => match self.approval_policy.action_for(&func.function.name) {
+                    ApprovalAction::Allow => Some(Decision::Approve),
+                    ApprovalAction::Ask => match &self.confirmer {
+                        Some(confirmer) => {
+                            let request = self.approval_request(func, turn);
+                            Some(confirmer.confirm(&request).await)
+                        }
+                        // 策略要问但无人可问 → 挂起（取代旧版的 fail-closed 拒绝）。
+                        None => None,
+                    },
+                },
+            };
+
+            match decision {
+                Some(Decision::Approve) => {
+                    let observation = self
+                        .execute(&func.function.name, &func.function.arguments)
+                        .await;
+                    self.on_observation(func, observation, turn, context, on_step)?;
+                }
+                Some(Decision::Deny) => {
+                    tracing::warn!(tool = %func.function.name, "工具调用被用户拒绝");
+                    let observation = format!(
                         "用户拒绝执行工具 `{}`。请不要原样重试，先说明用途或改用其它方案。",
-                        func.name
+                        func.function.name
                     );
+                    self.on_observation(func, observation, turn, context, on_step)?;
+                }
+                Some(Decision::Pending) | None => {
+                    return Ok(Some(PendingApproval {
+                        tool_call_id: func.id.clone(),
+                        request: self.approval_request(func, turn),
+                    }));
                 }
             }
         }
 
-        self.execute(&func.name, &func.arguments).await
+        Ok(None)
+    }
+
+    /// 组装「要问什么」。字段是给人看的；参数级粒度由确认方自己看 `arguments`。
+    fn approval_request(
+        &self,
+        func: &ChatCompletionMessageToolCall,
+        turn: usize,
+    ) -> ApprovalRequest {
+        ApprovalRequest {
+            turn,
+            tool: func.function.name.clone(),
+            description: self
+                .tools
+                .get(&func.function.name)
+                .map(|tool| tool.description().to_owned())
+                .unwrap_or_default(),
+            arguments: func.function.arguments.clone(),
+        }
     }
 
     async fn thinking(
         &mut self,
         turn: usize,
         context: &mut ExecuteContext,
-        on_step: &mut impl FnMut(&Step),
-        on_token: &mut (impl FnMut(usize, &str) + Send),
+        on_step: &mut (dyn for<'x> FnMut(&'x Step) + Send),
+        on_token: &mut (dyn for<'x> FnMut(usize, &'x str) + Send),
     ) -> anyhow::Result<Reply> {
         let reply = self
             .completer
@@ -347,8 +466,8 @@ impl ReactLoop {
     async fn finalize(
         &mut self,
         context: &mut ExecuteContext,
-        on_step: &mut impl FnMut(&Step),
-        on_token: &mut (impl FnMut(usize, &str) + Send),
+        on_step: &mut (dyn for<'x> FnMut(&'x Step) + Send),
+        on_token: &mut (dyn for<'x> FnMut(usize, &'x str) + Send),
     ) -> anyhow::Result<String> {
         // 用 system 指令而不是 user 消息收尾：这是对「本轮该如何作答」的运行期约束，
         // 与初始 system prompt 同类，也避免被后续 user/assistant 轮次稀释。
@@ -504,7 +623,7 @@ fn answer(
     content: String,
     turn: usize,
     context: &mut ExecuteContext,
-    on_step: &mut impl FnMut(&Step),
+    on_step: &mut (dyn for<'x> FnMut(&'x Step) + Send),
     termination: Termination,
 ) -> Option<Outcome> {
     on_step(&Step::Answer {
@@ -520,7 +639,18 @@ fn answer(
         answer: content,
         turns: turn,
         termination,
+        pending: None,
     })
+}
+
+/// 挂起结果：`answer` 为空，待审内容在 `pending` 里。
+fn suspended(turn: usize, pending: PendingApproval) -> Outcome {
+    Outcome {
+        answer: String::new(),
+        turns: turn,
+        termination: Termination::Suspended,
+        pending: Some(pending),
+    }
 }
 
 fn observe(context: &ExecuteContext) {
@@ -538,7 +668,6 @@ fn observe(context: &ExecuteContext) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -620,9 +749,10 @@ mod tests {
         reply
     }
 
-    fn trace(steps: &RefCell<Vec<Step>>) -> Vec<(usize, &'static str)> {
+    fn trace(steps: &Mutex<Vec<Step>>) -> Vec<(usize, &'static str)> {
         steps
-            .borrow()
+            .lock()
+            .expect("锁被毒化")
             .iter()
             .map(|step| match step {
                 Step::Thought { turn, .. } => (*turn, "thought"),
@@ -904,7 +1034,7 @@ mod tests {
         let mut agent = build(ScriptedCompleter::new(vec![calls_final_answer("42")]));
 
         let outcome = agent
-            .run("问题", |_| {}, |_, _| {})
+            .run("问题", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("应当成功");
 
@@ -925,7 +1055,7 @@ mod tests {
         let mut agent = build(completer.clone());
 
         let outcome = agent
-            .run("问题", |_| {}, |_, _| {})
+            .run("问题", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("应当成功");
 
@@ -947,7 +1077,7 @@ mod tests {
         ]));
 
         let outcome = agent
-            .run("用工具", |_| {}, |_, _| {})
+            .run("用工具", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("应当成功");
 
@@ -969,7 +1099,7 @@ mod tests {
         ]));
 
         let outcome = agent
-            .run("用工具", |_| {}, |_, _| {})
+            .run("用工具", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("工具失败不应中断循环");
 
@@ -985,7 +1115,7 @@ mod tests {
         ]));
 
         let outcome = agent
-            .run("用工具", |_| {}, |_, _| {})
+            .run("用工具", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("未知工具不应中断循环");
 
@@ -1000,12 +1130,12 @@ mod tests {
             calls_final_answer("补上的答案"),
         ]));
 
-        let observed = RefCell::new(Vec::new());
+        let observed = Mutex::new(Vec::new());
         let outcome = agent
             .run(
                 "问题",
-                |step| observed.borrow_mut().push(step.clone()),
-                |_, _| {},
+                &mut |step| observed.lock().expect("锁被毒化").push(step.clone()),
+                &mut |_, _| {},
             )
             .await
             .expect("参数非法不应中断循环");
@@ -1014,11 +1144,15 @@ mod tests {
         assert_eq!(outcome.termination, Termination::FinalAnswer);
         assert_eq!(outcome.answer, "补上的答案");
         assert!(
-            observed.borrow().iter().any(|step| matches!(
-                step,
-                Step::Observation { name, output, .. }
-                    if name == FINAL_ANSWER_TOOL && output.contains("工具执行失败")
-            )),
+            observed
+                .lock()
+                .expect("锁被毒化")
+                .iter()
+                .any(|step| matches!(
+                    step,
+                    Step::Observation { name, output, .. }
+                        if name == FINAL_ANSWER_TOOL && output.contains("工具执行失败")
+                )),
             "参数错误必须压成 Observation，实际轨迹：{:?}",
             trace(&observed)
         );
@@ -1036,12 +1170,12 @@ mod tests {
         ])]);
         let (mut agent, executed) = build_with_probe(completer, DEFAULT_MAX_TURNS);
 
-        let observed = RefCell::new(Vec::new());
+        let observed = Mutex::new(Vec::new());
         let outcome = agent
             .run(
                 "问题",
-                |step| observed.borrow_mut().push(step.clone()),
-                |_, _| {},
+                &mut |step| observed.lock().expect("锁被毒化").push(step.clone()),
+                &mut |_, _| {},
             )
             .await
             .expect("应当成功");
@@ -1090,7 +1224,7 @@ mod tests {
         let (mut agent, executed) = build_with_probe(completer, DEFAULT_MAX_TURNS);
 
         let outcome = agent
-            .run("问题", |_| {}, |_, _| {})
+            .run("问题", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("参数非法不应中断循环");
 
@@ -1114,12 +1248,12 @@ mod tests {
         ]);
         let mut agent = build_with_max_turns(completer.clone(), 2);
 
-        let observed = RefCell::new(Vec::new());
+        let observed = Mutex::new(Vec::new());
         let outcome = agent
             .run(
                 "一直用工具",
-                |step| observed.borrow_mut().push(step.clone()),
-                |_, _| {},
+                &mut |step| observed.lock().expect("锁被毒化").push(step.clone()),
+                &mut |_, _| {},
             )
             .await
             .expect("撞上限也应拿到答案");
@@ -1142,10 +1276,14 @@ mod tests {
             "循环内 required，收尾轮具名强制 final_answer"
         );
         assert!(
-            observed.borrow().iter().any(|step| matches!(
-                step,
-                Step::Answer { content, .. } if content == "被迫收尾的答案"
-            )),
+            observed
+                .lock()
+                .expect("锁被毒化")
+                .iter()
+                .any(|step| matches!(
+                    step,
+                    Step::Answer { content, .. } if content == "被迫收尾的答案"
+                )),
             "收尾轮也必须发 Step::Answer，实际轨迹：{:?}",
             trace(&observed)
         );
@@ -1160,7 +1298,7 @@ mod tests {
         let mut agent = build_with_max_turns(completer.clone(), 1);
 
         let outcome = agent
-            .run("问题", |_| {}, |_, _| {})
+            .run("问题", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("应当成功");
 
@@ -1184,7 +1322,7 @@ mod tests {
         let mut agent = build_with_max_turns(completer, 1);
 
         let outcome = agent
-            .run("问题", |_| {}, |_, _| {})
+            .run("问题", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("端点忽略强制也应软着陆");
 
@@ -1198,7 +1336,7 @@ mod tests {
         let mut agent = build_with_max_turns(completer, 1);
 
         let outcome = agent
-            .run("问题", |_| {}, |_, _| {})
+            .run("问题", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("收尾轮空响应不应让整个 run 报错");
 
@@ -1215,7 +1353,7 @@ mod tests {
         let mut agent = build_with_max_turns(completer, 1);
 
         let outcome = agent
-            .run("问题", |_| {}, |_, _| {})
+            .run("问题", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("收尾轮参数非法也应软着陆");
 
@@ -1235,12 +1373,12 @@ mod tests {
             calls_final_answer("最终答案"),
         ]));
 
-        let observed = RefCell::new(Vec::new());
+        let observed = Mutex::new(Vec::new());
         let outcome = agent
             .run(
                 "问题",
-                |step| observed.borrow_mut().push(step.clone()),
-                |_, _| {},
+                &mut |step| observed.lock().expect("锁被毒化").push(step.clone()),
+                &mut |_, _| {},
             )
             .await
             .expect("应当成功");
@@ -1260,12 +1398,12 @@ mod tests {
             calls_final_answer("答案"),
         ]));
 
-        let observed = RefCell::new(Vec::new());
+        let observed = Mutex::new(Vec::new());
         agent
             .run(
                 "问题",
-                |step| observed.borrow_mut().push(step.clone()),
-                |_, _| {},
+                &mut |step| observed.lock().expect("锁被毒化").push(step.clone()),
+                &mut |_, _| {},
             )
             .await
             .expect("应当成功");
@@ -1287,7 +1425,7 @@ mod tests {
         let mut agent = build(ScriptedCompleter::new(vec![Reply::default()]));
 
         let outcome = agent
-            .run("问题", |_| {}, |_, _| {})
+            .run("问题", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("空回复应当收束循环");
 
@@ -1333,12 +1471,12 @@ mod tests {
         let (mut agent, executed) =
             build_with_gate(completer, ask_for("echo"), Some(confirmer.clone()));
 
-        let observed = RefCell::new(Vec::new());
+        let observed = Mutex::new(Vec::new());
         let outcome = agent
             .run(
                 "问题",
-                |step| observed.borrow_mut().push(step.clone()),
-                |_, _| {},
+                &mut |step| observed.lock().expect("锁被毒化").push(step.clone()),
+                &mut |_, _| {},
             )
             .await
             .expect("拒绝不应中断循环");
@@ -1359,7 +1497,8 @@ mod tests {
         );
 
         let denied = observed
-            .borrow()
+            .lock()
+            .expect("锁被毒化")
             .iter()
             .find_map(|step| match step {
                 Step::Observation { output, .. } => Some(output.clone()),
@@ -1388,7 +1527,7 @@ mod tests {
             build_with_gate(completer, ask_for("echo"), Some(Arc::new(AutoApprove)));
 
         let outcome = agent
-            .run("问题", |_| {}, |_, _| {})
+            .run("问题", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("批准后应照常执行");
 
@@ -1397,7 +1536,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_without_confirmer_is_denied() {
+    async fn ask_without_confirmer_suspends() {
         let completer = ScriptedCompleter::new(vec![
             calls_echo(r#"{"q":"hi"}"#),
             calls_final_answer("退而求其次"),
@@ -1405,13 +1544,103 @@ mod tests {
         let (mut agent, executed) = build_with_gate(completer, ask_for("echo"), None);
 
         let outcome = agent
-            .run("问题", |_| {}, |_, _| {})
+            .run("问题", &mut |_| {}, &mut |_, _| {})
             .await
-            .expect("fail-closed 之后也应正常收尾");
+            .expect("挂起是正常返回，不是错误");
+
+        assert_eq!(outcome.termination, Termination::Suspended);
+        assert_eq!(outcome.answer, "");
+        assert_eq!(executed.count(), 0, "未获批准前不得执行");
+        assert_eq!(tool_messages(&agent), 0, "挂起时不给待决调用写 tool 消息");
+
+        let pending = outcome.pending.expect("挂起必须带待审内容");
+        assert_eq!(pending.request.tool, "echo");
+        assert_eq!(pending.request.turn, 1);
+        assert_eq!(pending.request.arguments, r#"{"q":"hi"}"#);
+
+        let batch = pending_batch(agent.history()).expect("历史里应留下未配对的调用");
+        assert_eq!(batch.next, 0);
+        assert_eq!(batch.calls.len(), 1);
+    }
+
+    /// 恢复：已完成的调用不重跑，待决调用恰好执行一次，随后照常收尾。
+    #[tokio::test]
+    async fn resume_continues_batch_without_rerunning_finished_calls() {
+        let completer = ScriptedCompleter::new(vec![
+            multi_call(vec![
+                ("call_nope", "nope", "{}"),
+                ("call_echo", "echo", r#"{"q":"hi"}"#),
+            ]),
+            calls_final_answer("恢复之后的答案"),
+        ]);
+        let (mut agent, executed) = build_with_gate(completer, ask_for("echo"), None);
+
+        let first = agent
+            .run("问题", &mut |_| {}, &mut |_, _| {})
+            .await
+            .expect("第一次应挂起");
+        assert_eq!(first.termination, Termination::Suspended);
+        assert_eq!(
+            first.pending.as_ref().map(|p| p.tool_call_id.as_str()),
+            Some("call_echo"),
+            "挂起的应是批次里第二个调用"
+        );
+        assert_eq!(executed.count(), 0);
+        assert_eq!(tool_messages(&agent), 1, "只有已完成的那一个调用有配对消息");
+
+        let observed = Mutex::new(Vec::new());
+        let outcome = agent
+            .resume(
+                Decision::Approve,
+                first.turns,
+                &mut |step| observed.lock().expect("锁被毒化").push(step.clone()),
+                &mut |_, _| {},
+            )
+            .await
+            .expect("恢复应成功");
 
         assert_eq!(outcome.termination, Termination::FinalAnswer);
-        assert_eq!(executed.count(), 0, "策略要问但无人可问时不得执行");
-        assert_eq!(tool_messages(&agent), 2);
+        assert_eq!(outcome.answer, "恢复之后的答案");
+        assert_eq!(executed.count(), 1, "待决调用恢复后恰好执行一次");
+        assert_eq!(
+            trace(&observed),
+            vec![(1, "observation"), (2, "answer")],
+            "恢复不重发已发出的 Step::Action"
+        );
+
+        let texts: Vec<String> = agent
+            .history()
+            .iter()
+            .filter_map(|m| match m {
+                ChatCompletionRequestMessage::Tool(tool) => match &tool.content {
+                    ChatCompletionRequestToolMessageContent::Text(text) => Some(text.clone()),
+                    ChatCompletionRequestToolMessageContent::Array(_) => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                "未知工具：nope".to_owned(),
+                r#"echo:{"q":"hi"}"#.to_owned(),
+                "恢复之后的答案".to_owned(),
+            ],
+            "先完成的调用没有被重跑，配对顺序不变"
+        );
+    }
+
+    /// 非挂起态调 `resume` 应报错。
+    #[tokio::test]
+    async fn resume_without_pending_batch_fails() {
+        let completer = ScriptedCompleter::new(vec![calls_final_answer("答案")]);
+        let (mut agent, _) = build_with_gate(completer, ask_for("echo"), None);
+
+        let result = agent
+            .resume(Decision::Approve, 1, &mut |_| {}, &mut |_, _| {})
+            .await;
+
+        assert!(result.is_err(), "没有未配对调用时 resume 应报错");
     }
 
     #[tokio::test]
@@ -1429,7 +1658,7 @@ mod tests {
         );
 
         let outcome = agent
-            .run("问题", |_| {}, |_, _| {})
+            .run("问题", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("默认策略应全放行");
 
@@ -1450,7 +1679,7 @@ mod tests {
         let mut agent = build(completer);
 
         let outcome = agent
-            .run("原始任务", |_| {}, |_, _| {})
+            .run("原始任务", &mut |_| {}, &mut |_, _| {})
             .await
             .expect("run 失败");
         assert_eq!(outcome.answer, "完成");

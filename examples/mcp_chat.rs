@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     let outcome = agent
         .run(
             &prompt,
-            |step| match step {
+            &mut |step| match step {
                 Step::Thought { turn, content } => println!("[{turn}] 思考：{content}"),
                 Step::Answer { turn, content } => println!("\n[{turn}] 答案：{content}"),
                 Step::Action {
@@ -138,7 +138,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("[{turn}] {name} 返回：{output}");
                 }
             },
-            |_, _| {},
+            &mut |_, _| {},
         )
         .await?;
 

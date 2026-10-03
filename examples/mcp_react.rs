@@ -100,6 +100,8 @@ impl Confirmer for ScriptedConfirmer {
         let label = match decision {
             Decision::Approve => "批准",
             Decision::Deny => "拒绝",
+            // 脚本确认方不会返回它；挂起路径的演示见 session 机制的示例。
+            Decision::Pending => "稍后决定（挂起）",
         };
         println!(
             "[确认] 工具 `{}` 参数 {}（脚本决策：{label}）",
@@ -220,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
     let outcome = agent
         .run(
             user_question,
-            |step| match step {
+            &mut |step| match step {
                 Step::Thought { turn, content } => println!("[{turn}] 思考：{content}"),
                 Step::Answer { turn, content } => println!("\n[{turn}] 答案：{content}"),
                 Step::Action {
@@ -232,7 +234,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("[{turn}] {name} 返回：{output}");
                 }
             },
-            |_, _| {},
+            &mut |_, _| {},
         )
         .await?;
 

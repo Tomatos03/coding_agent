@@ -7,9 +7,11 @@
 ```
 src/
 ├── agent/
-│   ├── llm/          # LLM 客户端、provider 配置、并发信号量
+│   ├── llm/          # LLM 客户端、provider 配置、并发信号量、消息回调接缝
 │   ├── rag/          # RAG 检索：embed / store / retriever（说明见 rag/README.md）
-│   └── react/        # ReAct 循环（runner/history/models/approval）
+│   ├── react/        # ReAct 循环（runner/history/models/approval/context）
+│   ├── runtime.rs    # 顶层 Agent：组装 SessionManager 并对外暴露 API
+│   └── session/      # 会话：Session / SessionManager（内存实现）
 ├── tools/
 │   ├── tool.rs       # Tool trait
 │   ├── local/        # 本地（进程内）工具，每个工具一个子目录
@@ -210,8 +212,10 @@ cargo run --example mcp_probe -- npx -y @modelcontextprotocol/server-everything
 cargo run --example mcp_react
 cargo run --example mcp_react -- npx -y @modelcontextprotocol/server-everything
 
-# ReAct 对话示例
-cargo run --example react_chat -- "什么是 MCP?"
+# 交互式会话 REPL：多轮对话 + 多会话（/sessions /switch /delete）+ 审批挂起与恢复（/resume）
+# 内存实现：退出即丢失全部会话
+cargo run --example react_chat
+cargo run --example react_chat -- --user alice "先读一下 README"
 
 # RAG 端到端检索：ingest 若干文本 → 提问 → 打印 top-k（会真实调用 embedding 端点，需要 EMBEDDING_*）
 cargo run --example rag_chat
@@ -228,6 +232,14 @@ cargo run --example tool_exec -- "rust async"
 # 需要 HF_TOKEN；带工具组使用本地工具 + mcp.json 中的 MCP 工具
 cargo run --bin gaia
 ```
+
+## Session 机制（多轮 / 多会话 / 审批挂起）
+
+`Agent`（`src/agent/runtime.rs`）持有 `SessionManager`，每个 session 对应一个常驻的 `ReactLoop`，因此「带着已有历史继续追问」是天然的。交互式循环也在同一个组件里：`Agent::run(&mut dyn Console)` 负责读入 → 命令 / 追问分发 → 驱动 → 展示，`Console` 把 I/O 挡在库外（示例接 stdin，测试接脚本化输入）。`Session` 存完整对话历史与调用方自定义的 `state`；标题、消息数、挂起态都从历史**派生**，不额外存字段。
+
+审批闸门判 `ask` 时：注入了 `Confirmer` 就问它，它可以选择「稍后决定」（`Decision::Pending`）；没有注入 `Confirmer` 则直接**挂起**——会话停在未执行完的工具批次上正常返回（`Termination::Suspended`），**无限期等待**，直到显式 `resume`（批准 / 拒绝）才从中断处继续。挂起期间可以切走、新建 / 删除其它会话，不会影响它；`/sessions` 会标出哪些会话在等审批。
+
+**本轮边界**：`SessionManager` 只有内存实现，**进程退出即丢失全部会话**；跨重启保留要等文件后端。
 
 ## 已知限制
 
