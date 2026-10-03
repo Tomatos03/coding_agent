@@ -13,14 +13,14 @@ paths:
   **注意不要开 `mod_module_files`**——它是反过来的那条，禁止 `mod.rs`。两者名字极易记混，实际语义以运行时行为为准。
 - **按概念命名文件，不按语言构造命名**。避免 `models.rs` / `impls.rs` 这种「按种类分堆」的文件名，它们会随规模增长变成杂物间。文件应回答「这里面是什么概念」：例如 `src/tools/mcp/{config,connection,tool}.rs`、`src/tools/local/web_search/mod.rs`。
   **带行为的结构体与它的 `impl`（含 `Tool` 的 trait 实现）放在同一个文件**。拆开不仅多一次跳转，还会逼字段用 `pub(crate)` 开口子；样板是 `src/tools/mcp/tool.rs`（`McpTool` + `impl Tool`）。
-  `models.rs` 仍适用于**纯领域词汇**（会流动的数据，如 `src/agent/react/models.rs` 的 `Step` / `Termination` / `Outcome`、`src/gaia/models.rs`）——它是「内容正好是词汇」的结果，不是「有目录就必须有」的规定。
+  `models.rs` 仍适用于**纯领域词汇**（会流动的数据，如 `src/react/models.rs` 的 `Step` / `Termination` / `Outcome`、`src/gaia/models.rs`）——它是「内容正好是词汇」的结果，不是「有目录就必须有」的规定。
 - **本地工具与 MCP 工具分目录**：本地（进程内）工具放 `src/tools/local/<tool>/`，并在 `local/mod.rs` 里声明 `pub mod` 与 `pub use`；MCP 远端工具在 `src/tools/mcp/`。新增本地工具时不要再往 `src/tools/` 根下加目录。
 - **模块必须被声明才会编译**。新建 `foo/bar.rs` 后忘了在 `foo/mod.rs` 里写 `pub mod bar;`，Rust **不报错也不警告**，那个文件被静默忽略，表现为「明明写了却找不到符号」。`constant/mod.rs` 里的 `pub mod` 与常量本身的 `pub` 同样缺一不可。
   同理，`#[cfg(test)] mod tests` 里的 `use super::*;` **只带得进父模块自己 import 过或定义过的东西**。类型被搬到别的文件后，测试要显式补 import——这个错会表现为「明明在同一个 crate 里却找不到」，而 IDE 的「优化 import」还可能误删那行。
 
 ## 错误处理
 
-统一用 `anyhow`：函数签名写 `anyhow::Result<T>`，用 `?` 传播。构造临时错误用 `anyhow::anyhow!`，条件缺失走 `.ok_or_else(|| anyhow::anyhow!("..."))` 而非 `unwrap()`——现有代码在解析 LLM 响应时一律如此（`src/agent/llm/models.rs` 的 `LLMClient`、`src/agent/react/runner.rs`）。
+统一用 `anyhow`：函数签名写 `anyhow::Result<T>`，用 `?` 传播。构造临时错误用 `anyhow::anyhow!`，条件缺失走 `.ok_or_else(|| anyhow::anyhow!("..."))` 而非 `unwrap()`——现有代码在解析 LLM 响应时一律如此（`src/llm/models.rs` 的 `LLMClient`、`src/react/runner.rs`）。
 
 **但有一处刻意例外**：`ReactLoop::execute` 的返回类型是 `String` 不是 `Result<String>`，因为工具失败必须变成一条 Observation 而不是中止循环。详见 `@rules/architecture.md` 第 5 节。
 
@@ -61,7 +61,7 @@ pub expression: String,
 
 ## 流式消费
 
-用 `futures::StreamExt`，再 `while let Some(item) = stream.next().await`（`src/agent/llm/models.rs` 的 `LLMClient::stream` 就是）。
+用 `futures::StreamExt`，再 `while let Some(item) = stream.next().await`（`src/llm/models.rs` 的 `LLMClient::stream` 就是）。
 
 `async-openai` 的流式 chunk 里，token 在 `chunk.choices.first()?.delta.content`——用 let-chains 一层层剥：`if let Some(choice) = chunk.choices.first() && let Some(delta) = &choice.delta.content`。
 

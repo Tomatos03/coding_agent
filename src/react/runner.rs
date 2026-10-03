@@ -5,11 +5,11 @@ use async_openai::types::chat::{
 };
 use tracing::info;
 
-use crate::agent::llm::models::{LLMClient, Reply, ToolPolicy};
-use crate::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
-use crate::agent::react::context::{Event, EventName, ExecuteContext, Role, Status};
-use crate::agent::react::history::{History, pending_batch};
-use crate::agent::react::models::{Outcome, PendingApproval, Step, Termination};
+use crate::llm::models::{LLMClient, Reply, ToolPolicy};
+use crate::react::approval::{ApprovalRequest, Confirmer, Decision};
+use crate::react::context::{Event, EventName, ExecuteContext, Role, Status};
+use crate::react::history::{History, pending_batch};
+use crate::react::models::{Outcome, PendingApproval, Step, Termination};
 use crate::settings::{ApprovalAction, ApprovalPolicy};
 use crate::tools::ToolHashMap;
 use crate::tools::local::final_answer::{self, FINAL_ANSWER_TOOL};
@@ -678,10 +678,10 @@ mod tests {
     };
     use serde_json::{Value, json};
 
-    use crate::agent::llm::callback::{Callback, CallbackEvent};
-    use crate::agent::llm::models::{Reply, ToolPolicy};
-    use crate::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
-    use crate::agent::react::models::DEFAULT_MAX_TURNS;
+    use crate::llm::callback::{Callback, CallbackEvent};
+    use crate::llm::models::{Reply, ToolPolicy};
+    use crate::react::approval::{ApprovalRequest, Confirmer, Decision};
+    use crate::react::models::DEFAULT_MAX_TURNS;
     use crate::settings::{ApprovalAction, ApprovalPolicy, ApprovalRule};
     use crate::tools::local::final_answer::{FINAL_ANSWER_TOOL, FinalAnswer};
     use crate::tools::tool::Tool;

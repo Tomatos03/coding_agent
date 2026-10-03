@@ -104,7 +104,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::agent::llm::models::{LLMClient, ToolPolicy};
+    use crate::llm::models::{LLMClient, ToolPolicy};
 
     /// 构造一条 user 消息，供测试注入 / 断言。
     fn user(text: &str) -> ChatCompletionRequestMessage {

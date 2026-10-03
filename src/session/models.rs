@@ -13,7 +13,7 @@ use async_openai::types::chat::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::agent::react::history::pending_batch;
+use crate::react::history::pending_batch;
 
 /// 标题截断的最大字符数（不是字节数）。
 const TITLE_MAX_CHARS: usize = 32;
@@ -46,7 +46,7 @@ pub struct Session {
 /// 挂起判据的轻量视图：历史里那个尚未执行的调用。
 ///
 /// 它只带历史里有的东西；`turn` 与 `description` 由 `SessionManager` 补齐成
-/// [`crate::agent::react::models::PendingApproval`]。
+/// [`crate::react::models::PendingApproval`]。
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingCall {
     pub tool_call_id: String,

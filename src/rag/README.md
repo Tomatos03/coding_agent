@@ -17,7 +17,7 @@
 | 位置 | 用途 |
 |---|---|
 | `src/constant/embedding.rs` | 三个环境变量名的常量：`EMBEDDING_API_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL_ID` |
-| `src/agent/llm/provider.rs` | `embedding_model_id()` 与 `embedding_client_config()`：embedding 专用的配置读取与客户端构造 |
+| `src/llm/provider.rs` | `embedding_model_id()` 与 `embedding_client_config()`：embedding 专用的配置读取与客户端构造 |
 
 ## 交互流程
 

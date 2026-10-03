@@ -22,13 +22,13 @@ use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::Arc;
 
-use coding_agent::agent::Agent;
-use coding_agent::agent::Console;
-use coding_agent::agent::llm::models::LLMClient;
-use coding_agent::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
-use coding_agent::agent::react::models::{DEFAULT_MAX_TURNS, Step};
+use coding_agent::Agent;
+use coding_agent::Console;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
+use coding_agent::llm::models::LLMClient;
+use coding_agent::react::approval::{ApprovalRequest, Confirmer, Decision};
+use coding_agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::settings::load_settings;
 use coding_agent::tools::build_tools;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};

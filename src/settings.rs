@@ -2,7 +2,7 @@
 //!
 //! 配置读自**工作区根目录**（即进程当前目录）下的 `.agents/settings.json`；读取不到时
 //! 返回全默认配置（全放行），与没有这道闸门时行为一致。本模块只回答「哪些工具要问」，
-//! 问谁、怎么问由 [`crate::agent::react::approval::Confirmer`] 决定。
+//! 问谁、怎么问由 [`crate::react::approval::Confirmer`] 决定。
 
 use std::path::Path;
 

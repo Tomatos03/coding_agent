@@ -1,6 +1,6 @@
-# agent 模块
+# 顶层组件
 
-顶层组件目录：把「一段消息进、一条回复出」的传输层，逐级组合成「多轮会话 + 审批挂起恢复」的顶层 `Agent`。纵向分四层，另有 `rag` 作为并列的独立切片：
+crate 根下的顶层组件：把「一段消息进、一条回复出」的传输层，逐级组合成「多轮会话 + 审批挂起恢复」的顶层 `Agent`。纵向分四层，另有 `rag` 作为并列的独立切片：
 
 ```
 runtime（顶层 Agent）
@@ -10,17 +10,18 @@ runtime（顶层 Agent）
 rag 并列存在，尚未接入循环
 ```
 
-## 包含关系
+## 关系
 
 ![Agent 组件的包含关系](assets/containment.svg)
 
 ```
-src/agent/
+src/
 ├── llm/           # 传输层：LLMClient + 回调接缝 + provider / semaphore / test_support
 ├── react/         # 编排层：ReactLoop / History / 审批闸门 / 运行上下文
 ├── session/       # 会话层：SessionManager + 每会话一个常驻 ReactLoop
 ├── runtime.rs     # 顶层：Agent / AgentBuilder / Console
-└── rag/           # 独立切片：Embedder / InMemoryStore / Retriever（说明见 rag/README.md）
+├── rag/           # 独立切片：Embedder / InMemoryStore / Retriever（说明见 rag/README.md）
+└── assets/        # 本 README 的插图（containment.svg）
 ```
 
 | 位置 | 关键类型 | 职责 |
@@ -61,7 +62,7 @@ gaia ──▶ react + llm::provider（带工具模式）；直答模式绕过 L
 4. 其余 `tool_call` 逐个走 `Step::Action` → 审批闸门（策略判 `ask` 时经 `Confirmer`）→ `Tool::execute` → `Step::Observation` 回填 `History`；工具失败 / 未知工具 / 拒绝都压成 Observation，不中断循环；
 5. 回到第 1 步；跑满 `max_turns` 由 `finalize()` 软收尾（裁工具面 + `Force(final_answer)`，绝不报错）。
 
-> 循环语义与陷阱详见 [`react/README.md`](react/README.md)；回调接缝的语义详见 [`architecture.md`](../../.claude/rules/architecture.md) 第 10 节。
+> 循环语义与陷阱详见 [`react/README.md`](react/README.md)；回调接缝的语义详见 [`architecture.md`](../.claude/rules/architecture.md) 第 10 节。
 
 ### 多轮会话与审批挂起
 

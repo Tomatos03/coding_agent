@@ -4,7 +4,7 @@ pub const DEFAULT_MAX_TURNS: usize = 12;
 #[derive(Debug, Clone)]
 pub struct PendingApproval {
     pub tool_call_id: String,
-    pub request: crate::agent::react::approval::ApprovalRequest,
+    pub request: crate::react::approval::ApprovalRequest,
 }
 
 #[derive(Debug, Clone)]

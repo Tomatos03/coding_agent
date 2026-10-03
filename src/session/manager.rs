@@ -13,11 +13,11 @@ use serde_json::json;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::agent::llm::models::LLMClient;
-use crate::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
-use crate::agent::react::history::History;
-use crate::agent::react::models::{Outcome, PendingApproval, Step, Termination};
-use crate::agent::react::runner::ReactLoop;
+use crate::llm::models::LLMClient;
+use crate::react::approval::{ApprovalRequest, Confirmer, Decision};
+use crate::react::history::History;
+use crate::react::models::{Outcome, PendingApproval, Step, Termination};
+use crate::react::runner::ReactLoop;
 use crate::settings::ApprovalPolicy;
 use crate::tools::ToolHashMap;
 
@@ -318,13 +318,13 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::agent::react::models::DEFAULT_MAX_TURNS;
+    use crate::react::models::DEFAULT_MAX_TURNS;
     use crate::settings::{ApprovalAction, ApprovalRule};
     use crate::tools::local::final_answer::{FINAL_ANSWER_TOOL, FinalAnswer};
     use crate::tools::tool::Tool;
 
-    use crate::agent::llm::callback::{Callback, CallbackEvent};
-    use crate::agent::llm::models::Reply;
+    use crate::llm::callback::{Callback, CallbackEvent};
+    use crate::llm::models::Reply;
 
     /// 脚本化 `LLMClient`：按预置回复队列驱动会话，并记录每次请求。
     fn scripted(replies: Vec<Reply>) -> Arc<LLMClient> {

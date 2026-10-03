@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
 use coding_agent::{
-    agent::llm::{models::LLMClient, provider, semaphore::get_semaphore},
     gaia::{
         dataset::load_gaia_level1,
         evaluator::{evaluate_gaia_with_tools, evaluate_gaia_without_tools},
         models::{GaiaEvalResult, GaiaMode},
         report::summarize,
     },
+    llm::{models::LLMClient, provider, semaphore::get_semaphore},
     tools::build_tools,
 };
 use tokio::task::JoinSet;

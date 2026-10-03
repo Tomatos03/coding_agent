@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use crate::agent::llm::models::LLMClient;
 use crate::gaia::{
     models::{GaiaEvalResult, GaiaMode, GaiaOutput, GaiaRow},
     solver::{
@@ -8,6 +7,7 @@ use crate::gaia::{
         solve_gaia_question_with_tools_retry,
     },
 };
+use crate::llm::models::LLMClient;
 use crate::tools::ToolHashMap;
 
 pub fn is_correct(predicate: &str, answer: &str) -> bool {
@@ -81,7 +81,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::agent::llm::models::Reply;
+    use crate::llm::models::Reply;
     use crate::tools::local::final_answer::{FINAL_ANSWER_TOOL, FinalAnswer};
     use crate::tools::tool::Tool;
 

@@ -2,7 +2,7 @@
 
 ```bash
 cargo build
-cargo run                          # bin: coding_agent —— History + LLMClient::complete 的单轮 demo（main.rs）
+cargo run                          # bin: coding_agent —— 交互式 Agent REPL（多轮会话 + 审批挂起；需要 LLM 凭证）
 cargo run --bin gaia               # GAIA Level 1 对比评测：每题各跑一次「带工具 / 不带工具」，输出两组通过数/通过率；需要 HF_TOKEN
 cargo run --example react_chat     # 交互式会话 REPL：多轮对话 + /sessions /switch /delete /resume（需要 LLM 凭证）
 cargo run --example stream_chat    # 流式输出
@@ -24,7 +24,7 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 
 **当前 263 个测试**：默认跑 259 个（全部离线，不联网、不需要凭证），另外 4 个是 `#[ignore]`：3 个 MCP 集成测试（需要本机 `python3`）+ 1 个 embedding 真实端点联测（需要 `EMBEDDING_*` 凭证）。下列按文件列举重点覆盖，非全部测试。
 
-`src/agent/react/runner.rs` 20 个，覆盖循环逻辑：
+`src/react/runner.rs` 20 个，覆盖循环逻辑：
 
 - 调 `final_answer` → `Termination::FinalAnswer`，答案取 `execute` 的返回值，且该调用有配对 tool 消息
 - 纯文本回复（无 tool_calls）→ 端点无视了 `required`，降级为 `Termination::ModelFinished`；同时断言循环内收到的策略是 `Required`
@@ -47,17 +47,17 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 
 后两条用 `trace()` 辅助函数把 `Step` 压成 `(轮次, 类型)` 序列做整体比对——比逐个 `assert!(matches!(...))` 更能钉住**顺序**，而这两条的核心正是发射顺序。
 
-`src/agent/react/context.rs` 6 个：`ExecuteContext` 每次构造拿到唯一 id 且初始 `Running`、`set_status` 的状态流转、`Event` 记录 name/content/role/timestamp、事件序列化为平铺 JSON（毫秒时间戳）、`set_turn` 只保留当前轮事件、事件保持插入顺序。
+`src/react/context.rs` 6 个：`ExecuteContext` 每次构造拿到唯一 id 且初始 `Running`、`set_status` 的状态流转、`Event` 记录 name/content/role/timestamp、事件序列化为平铺 JSON（毫秒时间戳）、`set_turn` 只保留当前轮事件、事件保持插入顺序。
 
-`src/agent/llm/models.rs` 9 个：
+`src/llm/models.rs` 9 个：
 
 - 流式分片重组（`ToolCallAccumulator`）3 个：单个调用的 `arguments` 被切成 4 片 → 拼回完整字符串；两个调用的分片交错到达 → 各归各的槽位；中间有空槽位 → `finish()` 丢掉没拿到 `name` 的
 - 策略 → 请求体 3 个（`build_chat_request` 纯函数，序列化后断言）：`Required` → `tool_choice == "required"` 且 `parallel_tool_calls == true`；`Force("final_answer")` → `tool_choice == {"type":"function",...}`；**`tools == None` 时 `tool_choice` 键必须消失**（否则 `required` + 零工具会被服务端 400 拒绝）
 - `tool_choice` 被拒判定 3 个：400 + `param:"tool_choice"`（或消息里点名）命中；429 / 500 / 不相关的 400 不命中；只有非 `Auto` 策略才值得重发
 
-`src/agent/llm/callback.rs` 8 个（全部离线；假内层传输层记录收到的消息并返回预置 `Reply`，假回调按事件记录轨迹）：`BeforeSend` 注入的消息送达内层；`AfterSend` 改写的 `Reply` 出现在返回值里；空回调列表 = 透传；洋葱顺序 `[outer:before, inner:before, inner:after, outer:after]` 且两层互相可见对方的改动；`BeforeSend` 报错时整个请求中止且内层**未被调用**（fail-closed）；`AfterSend` 报错即便回复已到手也传播；只处理 `BeforeSend` 的放行模板照常参与全链（两个事件都会送达）；stream 路径同样派发两种事件且 `on_token` 直通不受影响。
+`src/llm/callback.rs` 8 个（全部离线；假内层传输层记录收到的消息并返回预置 `Reply`，假回调按事件记录轨迹）：`BeforeSend` 注入的消息送达内层；`AfterSend` 改写的 `Reply` 出现在返回值里；空回调列表 = 透传；洋葱顺序 `[outer:before, inner:before, inner:after, outer:after]` 且两层互相可见对方的改动；`BeforeSend` 报错时整个请求中止且内层**未被调用**（fail-closed）；`AfterSend` 报错即便回复已到手也传播；只处理 `BeforeSend` 的放行模板照常参与全链（两个事件都会送达）；stream 路径同样派发两种事件且 `on_token` 直通不受影响。
 
-Session 相关 22 个（全部离线）：`src/agent/session/models.rs` 4 个（标题按字符截断 / `pending_call` 从历史推导的四种形态 / 摘要带挂起标记 / serde round-trip）；`src/agent/session/manager.rs` 11 个（create 唯一且只含 system、get/delete 的缺失语义、list 过滤与排序、多轮累积历史、**挂起并写 `state.turn`**、resume 批准恰好执行一次、resume 拒绝压成 Observation、挂起态 `send` 与非挂起态 `resume` 都报错、**同会话并发串行不丢消息**、**不同会话互不阻塞**（用 Notify 门控证明）、**挂起无限期可恢复**）；`src/agent/runtime.rs` 7 个（`default_user` 落到会话、builder 默认全放行、`Agent` 委派与 manager 一致；**`Agent::run` 的循环**：首次追问自动建会话并报答案、斜杠命令分发与 `/quit` 收尾、挂起提示 + `/resume y` 继续、单轮出错只打印并继续——脚本化 `Console` 驱动，不碰真实终端）。
+Session 相关 22 个（全部离线）：`src/session/models.rs` 4 个（标题按字符截断 / `pending_call` 从历史推导的四种形态 / 摘要带挂起标记 / serde round-trip）；`src/session/manager.rs` 11 个（create 唯一且只含 system、get/delete 的缺失语义、list 过滤与排序、多轮累积历史、**挂起并写 `state.turn`**、resume 批准恰好执行一次、resume 拒绝压成 Observation、挂起态 `send` 与非挂起态 `resume` 都报错、**同会话并发串行不丢消息**、**不同会话互不阻塞**（用 Notify 门控证明）、**挂起无限期可恢复**）；`src/runtime.rs` 7 个（`default_user` 落到会话、builder 默认全放行、`Agent` 委派与 manager 一致；**`Agent::run` 的循环**：首次追问自动建会话并报答案、斜杠命令分发与 `/quit` 收尾、挂起提示 + `/resume y` 继续、单轮出错只打印并继续——脚本化 `Console` 驱动，不碰真实终端）。
 
 `src/tools/local/final_answer/mod.rs` 5 个：`execute` 把输入参数原样返回、可重复调用（纯函数）、`extract_answer` 容忍首尾空白、拒绝非法 JSON / 缺字段 / 空串、`execute` 传播解析错误。
 
@@ -70,7 +70,7 @@ MCP 相关共 32 个：
 
 GAIA 相关 11 个（全部离线）：`src/gaia/solver.rs` 6 个（严格 JSON / 代码块与正文包裹 / 字符串内花括号 / 纯文本兜底 / 空内容报错 / 无平衡对象），`src/gaia/report.rs` 2 个（按模型×模式汇总、通过率边界），`src/gaia/evaluator.rs` 2 个（脚本化 `LLMClient` 跑通带工具的 ReAct 路径并统计工具调用次数；**`final_answer` 不计入工具调用**），`src/gaia/models.rs` 1 个（`schemars` 的 `deny_unknown_fields` 只作用于 JSON Schema，serde 侧仍忽略未知字段）。
 
-RAG 相关 16 个：`src/agent/rag/store.rs` 12 个（余弦五态：相同/平行/正交/相反/零向量；空向量与维度守卫；降序排序、top_k 截断/为 0、空库、查询维度不符），全部离线；`src/agent/rag/embed.rs` 4 个（1 个 ignored：请求体序列化、首条向量提取、空 data 报错；真实端点联测）。
+RAG 相关 16 个：`src/rag/store.rs` 12 个（余弦五态：相同/平行/正交/相反/零向量；空向量与维度守卫；降序排序、top_k 截断/为 0、空库、查询维度不符），全部离线；`src/rag/embed.rs` 4 个（1 个 ignored：请求体序列化、首条向量提取、空 data 报错；真实端点联测）。
 
 4 个 `#[ignore]` 里，3 个 MCP 集成测试需要 `python3` + `tests/fixtures/fake_mcp_server.py`，1 个 embedding 联测需要 `EMBEDDING_*` 凭证；跑法都是：
 
@@ -116,4 +116,4 @@ MCP server 配置走**文件** `mcp.json`（位于当前工作目录，当前不
 
 无 `rust-toolchain.toml`，也没接 CI。`edition = "2024"` 需要 rustc ≥ 1.85（实际用到 let-chains 与 `Result::inspect_err`，需要 ≥ 1.88 / 1.76）。
 
-`Cargo.toml` 里的 `async-stream` 目前**没有任何调用方**，属于待清理项（`uuid` 已被 `src/agent/react/context.rs` 使用）。
+`Cargo.toml` 里的 `async-stream` 目前**没有任何调用方**，属于待清理项（`uuid` 已被 `src/react/context.rs` 使用）。

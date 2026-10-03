@@ -1,13 +1,11 @@
 use coding_agent::{
-    agent::{
-        llm::{
-            models::{LLMClient, ToolPolicy},
-            semaphore::get_semaphore,
-        },
-        react::history::History,
-    },
     bootstrap::init,
     constant::prompt::SYSTEM_PROMPT,
+    llm::{
+        models::{LLMClient, ToolPolicy},
+        semaphore::get_semaphore,
+    },
+    react::history::History,
 };
 
 const TASKS: usize = 5;

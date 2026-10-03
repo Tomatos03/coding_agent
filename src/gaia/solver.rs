@@ -6,10 +6,10 @@ use async_openai::types::chat::{
 };
 use backon::{ExponentialBuilder, Retryable};
 
-use crate::agent::llm::{models::LLMClient, provider};
-use crate::agent::react::models::{DEFAULT_MAX_TURNS, Step};
-use crate::agent::react::runner::ReactLoop;
 use crate::gaia::models::GaiaOutput;
+use crate::llm::{models::LLMClient, provider};
+use crate::react::models::{DEFAULT_MAX_TURNS, Step};
+use crate::react::runner::ReactLoop;
 use crate::tools::ToolHashMap;
 use crate::tools::local::final_answer::FINAL_ANSWER_TOOL;
 

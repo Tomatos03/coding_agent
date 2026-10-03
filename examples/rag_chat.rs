@@ -1,6 +1,6 @@
 use coding_agent::{
-    agent::rag::{embed::Embedder, retriever::Retriever},
     bootstrap::init,
+    rag::{embed::Embedder, retriever::Retriever},
 };
 
 #[tokio::main]

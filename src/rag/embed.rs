@@ -1,4 +1,4 @@
-use crate::agent::llm::provider;
+use crate::llm::provider;
 
 use async_openai::config::OpenAIConfig;
 use async_openai::types::embeddings::{

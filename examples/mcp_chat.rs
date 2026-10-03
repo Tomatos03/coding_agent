@@ -16,12 +16,12 @@
 use std::io::Write as _;
 use std::sync::Arc;
 
-use coding_agent::agent::llm::models::LLMClient;
-use coding_agent::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
-use coding_agent::agent::react::models::{DEFAULT_MAX_TURNS, Step};
-use coding_agent::agent::react::runner::ReactLoop;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
+use coding_agent::llm::models::LLMClient;
+use coding_agent::react::approval::{ApprovalRequest, Confirmer, Decision};
+use coding_agent::react::models::{DEFAULT_MAX_TURNS, Step};
+use coding_agent::react::runner::ReactLoop;
 use coding_agent::settings::{ApprovalAction, SETTINGS_PATH, load_settings};
 use coding_agent::tools::build_tools;
 

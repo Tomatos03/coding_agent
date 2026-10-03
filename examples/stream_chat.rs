@@ -1,7 +1,7 @@
-use coding_agent::agent::llm::models::{LLMClient, ToolPolicy};
-use coding_agent::agent::react::history::History;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
+use coding_agent::llm::models::{LLMClient, ToolPolicy};
+use coding_agent::react::history::History;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

@@ -4,18 +4,18 @@
 
 ## 1. 客户端构造只有两条路径：`provider::client_config()` 与 `embedding_client_config()`
 
-所有 `async_openai::Client` 都经 `src/agent/llm/provider.rs` 构造，按用途分两条：
+所有 `async_openai::Client` 都经 `src/llm/provider.rs` 构造，按用途分两条：
 
 ```rust
 let client = async_openai::Client::with_config(provider::client_config()?);           // 对话
 let client = async_openai::Client::with_config(provider::embedding_client_config()?); // embedding
 ```
 
-`client_config()` 现被两处共用：`src/agent/llm/models.rs` 的 `LLMClient`（构造真实后端时）、`src/gaia/solver.rs` 的 `solve_gaia_question`。
+`client_config()` 现被两处共用：`src/llm/models.rs` 的 `LLMClient`（构造真实后端时）、`src/gaia/solver.rs` 的 `solve_gaia_question`。
 
 它按 `CURRENT_USE_PROVIDER`（缺失时回退到 `constant::provider::DEFAULT_PROVIDER`）在 `constant::provider::PROVIDER_BASE_URL_VARS` 中查出该 provider 对应的 `*_API_BASE_URL` 与 `*_API_KEY` 两个环境变量名，任一缺失都报错并指明是哪个 provider 的哪个变量。
 
-`embedding_client_config()` 现由 `src/agent/rag/embed.rs` 的 `Embedder::new` 独用，配套的模型 ID 由 `embedding_model_id()` 读取。两者直接读 `EMBEDDING_API_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL_ID`（变量名常量在 `constant::embedding`），**不随 `CURRENT_USE_PROVIDER` 切换**。
+`embedding_client_config()` 现由 `src/rag/embed.rs` 的 `Embedder::new` 独用，配套的模型 ID 由 `embedding_model_id()` 读取。两者直接读 `EMBEDDING_API_BASE_URL` / `EMBEDDING_API_KEY` / `EMBEDDING_MODEL_ID`（变量名常量在 `constant::embedding`），**不随 `CURRENT_USE_PROVIDER` 切换**。
 
 **不要写成 `async_openai::Client::new()`**——那走的是 `OpenAIConfig::default()`，读的是 `async-openai` 自己的 `OPENAI_BASE_URL`，本项目 `.env` 里没有这个变量，会静默 fallback 到 `https://api.openai.com/v1`，表现为认证失败或 404，而不是「没读到 base url」这种直观报错。跨模块搬运代码时尤其注意。
 
@@ -46,7 +46,7 @@ Prompt must contain the word 'json' in some form to use 'response_format' of typ
 
 ## 3. 并发闸门由调用方负责，不在传输层内部
 
-`src/agent/llm/semaphore.rs` 的 `get_semaphore()` 返回进程级 `&'static Semaphore`（3 permits），但 `LLMClient` 的两个方法（`complete` / `stream`）**内部都不会去获取它**。限流是否生效完全取决于调用方。
+`src/llm/semaphore.rs` 的 `get_semaphore()` 返回进程级 `&'static Semaphore`（3 permits），但 `LLMClient` 的两个方法（`complete` / `stream`）**内部都不会去获取它**。限流是否生效完全取决于调用方。
 
 正确样板有两处：`src/bin/gaia.rs` 的 `gaia_level1_experiment()`、`examples/semaphore_chat.rs`——在 `JoinSet` 的每个 task 内部 `get_semaphore().acquire().await?`，用完 `drop(permit)`。
 
@@ -64,7 +64,7 @@ Prompt must contain the word 'json' in some form to use 'response_format' of typ
 
 ## 5. ReAct 循环的四条不变量
 
-`src/agent/react/runner.rs` 的 `ReactLoop::run` 是全仓库唯一实现「请求 → 工具调用 → 回填 → 再请求」的地方（真实后端曾经有过一份自己的闭环，已随 `chat()` 一起删除）。四条不变量都是**违反时不报错、只在运行期静默出错**的：
+`src/react/runner.rs` 的 `ReactLoop::run` 是全仓库唯一实现「请求 → 工具调用 → 回填 → 再请求」的地方（真实后端曾经有过一份自己的闭环，已随 `chat()` 一起删除）。四条不变量都是**违反时不报错、只在运行期静默出错**的：
 
 **① `execute` 返回 `String`，不返回 `Result<String>`。**
 
@@ -86,7 +86,7 @@ async fn execute(&self, name: &str, arguments: &str) -> String
 
 `src/tools/local/final_answer/mod.rs` 的 `execute` **输入即输出**：解析 `answer` 参数后原样返回。于是循环用统一的 `action → execute → Observation` 路径就能拿到最终答案，每个 `tool_call` 也天然有配对 tool 消息（不变量②）。循环的终止判据是「参数可解析」（`extract_answer`），交付值取 `execute` 的返回值——两者同源、必然一致。**若改成「在 `execute` 之前拦截、跳过执行」，同轮其它 `tool_call` 就会失去配对 tool 消息。** `extract_answer` / `execute` 必须是纯函数：给这个工具加副作用会破坏「可安全重复调用」这条隐含约定。
 
-**审批闸门（危险工具确认）在 `run_pending_calls()` 里、`Step::Action` 之后、`execute()` 之前。** `ReactLoop` 持有 `approval_policy`（来自工作区根目录的 `.agents/settings.json`，经 `src/settings.rs` 的 `load_settings()` 加载；缺文件 = 全默认 = 全放行）与可选 `confirmer`（`src/agent/react/approval.rs` 的 `Confirmer` trait）。`action_for(name)` 判 `ask` 时经 `Confirmer` 拿决定：**拒绝被压成一条 Observation**（「用户拒绝执行工具…」）——它不是 `Err`、也不是 `execute` 之前的特例分支，而是与「工具失败 / 未知工具」完全相同的通道，不变量①②原样成立，消费方不用学新事件类型。两条静默陷阱：**(a)** 策略判 `ask` 但调用方未注入 `confirmer` 时**挂起**（`Termination::Suspended`），不再 fail-closed 直接拒绝——会话停在未执行完的工具批次上，等 session 层带决定 `resume`（`Confirmer` 主动返回 `Decision::Pending` 走同一条路；这是行为变更，详见第 11 节）；**(b)** 匹配只按**暴露名**做 glob（`*` 通配任意字符序列；`*__*` 恰命中一切 MCP 工具），参数级粒度（rm 拦、ls 放行）留给 `Confirmer` 自己看 `arguments`。豁免路径无需特判：`final_answer` 的交付路径与 `finalize()` 都不执行工具，结构上到不了闸门。`ReactLoop` 只收算好的 `ApprovalPolicy` / `Confirmer` 对象，自己不读文件——与「收 `ToolHashMap` 而不跑 `build_tools()`」同一条原则；配置启动时读一次，改完重启生效（与 `mcp.json` 一致）。
+**审批闸门（危险工具确认）在 `run_pending_calls()` 里、`Step::Action` 之后、`execute()` 之前。** `ReactLoop` 持有 `approval_policy`（来自工作区根目录的 `.agents/settings.json`，经 `src/settings.rs` 的 `load_settings()` 加载；缺文件 = 全默认 = 全放行）与可选 `confirmer`（`src/react/approval.rs` 的 `Confirmer` trait）。`action_for(name)` 判 `ask` 时经 `Confirmer` 拿决定：**拒绝被压成一条 Observation**（「用户拒绝执行工具…」）——它不是 `Err`、也不是 `execute` 之前的特例分支，而是与「工具失败 / 未知工具」完全相同的通道，不变量①②原样成立，消费方不用学新事件类型。两条静默陷阱：**(a)** 策略判 `ask` 但调用方未注入 `confirmer` 时**挂起**（`Termination::Suspended`），不再 fail-closed 直接拒绝——会话停在未执行完的工具批次上，等 session 层带决定 `resume`（`Confirmer` 主动返回 `Decision::Pending` 走同一条路；这是行为变更，详见第 11 节）；**(b)** 匹配只按**暴露名**做 glob（`*` 通配任意字符序列；`*__*` 恰命中一切 MCP 工具），参数级粒度（rm 拦、ls 放行）留给 `Confirmer` 自己看 `arguments`。豁免路径无需特判：`final_answer` 的交付路径与 `finalize()` 都不执行工具，结构上到不了闸门。`ReactLoop` 只收算好的 `ApprovalPolicy` / `Confirmer` 对象，自己不读文件——与「收 `ToolHashMap` 而不跑 `build_tools()`」同一条原则；配置启动时读一次，改完重启生效（与 `mcp.json` 一致）。
 
 **循环内每轮都是 `tool_choice=required`。** 服务端保证回复里至少有一个 `tool_call`，所以模型**只能**靠 `final_answer` 结束，`content` 永远只是 thought。两条降级路径兜底：(a) 回复里没有 `tool_calls` → 端点无视了强制，把 `content` 当答案收尾（`Termination::ModelFinished`）；(b) 端点以 400 明确拒绝 `tool_choice` → 真实后端置粘性标记（`AtomicBool`）、改用 `Auto` 重发一次，此后所有请求都不再强制。`ToolPolicy`（`Auto` / `Required` / `Force(name)`）是请求级参数，随每轮传入 `LLMClient`，不能写进 messages。
 
@@ -107,13 +107,13 @@ async fn execute(&self, name: &str, arguments: &str) -> String
 
 `ReactLoop::run` 同时接收 `on_step` 与 `on_token` 两个回调；`examples/react_chat.rs` 传入空的 `on_token`（只消费 `on_step`）——它要演示的是**循环结构**，而 `examples/stream_chat.rs` 已经覆盖了流式。想两者都要，得靠 ANSI 回写重打，属于渲染层的事，不该让 `Step` 去承担。
 
-**流式下的 `tool_calls` 按 `index` 重组。** chunk 里的 `delta.tool_calls` 是分片到达的——`id` 和 `name` 通常只出现在第一片，`arguments` 被切成多片。`src/agent/llm/models.rs` 的 `ToolCallAccumulator` 负责拼接：按 `index` 找槽位（必要时 `resize_with` 补齐），逐片 `push_str`，`finish()` 时丢掉从没拿到 `name` 的空槽。
+**流式下的 `tool_calls` 按 `index` 重组。** chunk 里的 `delta.tool_calls` 是分片到达的——`id` 和 `name` 通常只出现在第一片，`arguments` 被切成多片。`src/llm/models.rs` 的 `ToolCallAccumulator` 负责拼接：按 `index` 找槽位（必要时 `resize_with` 补齐），逐片 `push_str`，`finish()` 时丢掉从没拿到 `name` 的空槽。
 
 **改这段逻辑时注意**：`arguments` 是**字符串拼接**，不是 JSON 合并——中间态必然是非法 JSON，不能边收边解析。这条路径由 3 个单元测试覆盖（见 `commands.md` 的测试一节）。
 
 ## 6. provider 与模型 ID 必须配套
 
-两者都来自环境变量，但由 `src/agent/llm/provider.rs` 分别读取，行为不同：
+两者都来自环境变量，但由 `src/llm/provider.rs` 分别读取，行为不同：
 
 | | 读取函数 | 缓存 | 缺失时 |
 |---|---|---|---|
@@ -174,7 +174,7 @@ pub struct ChatCompletionStreamResponseDelta {
 
 ## 9. RAG 检索层（内存版）
 
-`src/agent/rag/` 把检索拆成三个组件：`Embedder`（文本 → `Vec<f32>`）、`InMemoryStore`（内存向量库）、`Retriever`（组装层）。完整说明与流程图见 `src/agent/rag/README.md`；这里只列跨组件的陷阱：
+`src/rag/` 把检索拆成三个组件：`Embedder`（文本 → `Vec<f32>`）、`InMemoryStore`（内存向量库）、`Retriever`（组装层）。完整说明与流程图见 `src/rag/README.md`；这里只列跨组件的陷阱：
 
 - **入库与查询必须同一 embedding 模型。** 更换 `EMBEDDING_MODEL_ID` 而沿用旧数据 = 拿错尺子量：分数照算、零报错，只是全部无意义。换模型必须重建索引。
 - **维度守卫在 `InMemoryStore::insert`**：首条入库定下 `dim`，此后逐条校验；`search` 同样校验查询向量。缺了它，`zip` 对不等长切片**静默截断**（同第 5 节「违反不报错」家族）。
@@ -184,7 +184,7 @@ pub struct ChatCompletionStreamResponseDelta {
 
 ## 10. 消息发送前后的回调（`Callback`）
 
-`src/agent/llm/callback.rs` 的回调链直接挂在传输层的唯一类型 `LLMClient` 上（`LLMClient::with_callbacks`，派发在模块内的 `prepare` / `conclude`）：每轮请求前后派发一次，`ReactLoop`、`History`、`src/tools/` 的**生产代码零改动**——不注册回调时，全链路与没有这层时逐字节一致。
+`src/llm/callback.rs` 的回调链直接挂在传输层的唯一类型 `LLMClient` 上（`LLMClient::with_callbacks`，派发在模块内的 `prepare` / `conclude`）：每轮请求前后派发一次，`ReactLoop`、`History`、`src/tools/` 的**生产代码零改动**——不注册回调时，全链路与没有这层时逐字节一致。
 
 **接缝形状。** 根特征 `Callback` 只有一个方法 `call(event)`，挂点做成数据（`CallbackEvent` 枚举）：`BeforeSend { messages: &mut Vec<_> }` 与 `AfterSend { messages: &[..], reply: &mut Reply }`。能力约束做进类型——`BeforeSend` 只给可变消息，`AfterSend` 消息只读、只有回复可改。枚举标 `#[non_exhaustive]`：将来新增挂点（工具前后、Step 事件等）只加变体，trait / 派发逻辑 / 既有实现都不变；实现用 `let CallbackEvent::X { .. } = event else { return Ok(()) };` 放行模板即可对新增变体免疫（外部 crate 的 `match` 必须带通配臂）。
 
@@ -202,7 +202,7 @@ pub struct ChatCompletionStreamResponseDelta {
 
 ## 11. Session 机制（多轮会话 / 多会话管理 / 审批挂起）
 
-`src/agent/session/` 与 `src/agent/runtime.rs` 把「一次 run」升级成「一段可管理的会话」。组件关系：
+`src/session/` 与 `src/runtime.rs` 把「一次 run」升级成「一段可管理的会话」。组件关系：
 
 ```
 Agent（runtime.rs：组装配置 + 委派）

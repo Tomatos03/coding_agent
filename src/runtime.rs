@@ -1,20 +1,18 @@
 //! 顶层 `Agent` 组件：组装一个 `SessionManager`，并把用户 API 委派给它。
 //!
 //! `Agent` 自己不跑循环——多轮、挂起、恢复都在
-//! [`SessionManager`](crate::agent::session::manager::SessionManager) 里，
+//! [`SessionManager`](crate::session::manager::SessionManager) 里，
 //! 因为「每个 session 一个常驻 `ReactLoop`」这件事由它持有。
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::agent::llm::models::LLMClient;
-use crate::agent::react::approval::{Confirmer, Decision};
-use crate::agent::react::models::{Outcome, PendingApproval, Step, Termination};
-use crate::agent::session::manager::{
-    InMemorySessionManager, SessionManager, SessionRuntimeConfig,
-};
-use crate::agent::session::models::{Session, SessionSummary};
+use crate::llm::models::LLMClient;
+use crate::react::approval::{Confirmer, Decision};
+use crate::react::models::{Outcome, PendingApproval, Step, Termination};
+use crate::session::manager::{InMemorySessionManager, SessionManager, SessionRuntimeConfig};
+use crate::session::models::{Session, SessionSummary};
 use crate::settings::ApprovalPolicy;
 use crate::tools::ToolHashMap;
 
@@ -444,8 +442,8 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use crate::agent::llm::models::Reply;
-    use crate::agent::react::models::DEFAULT_MAX_TURNS;
+    use crate::llm::models::Reply;
+    use crate::react::models::DEFAULT_MAX_TURNS;
     use crate::settings::{ApprovalAction, ApprovalPolicy, ApprovalRule};
     use crate::tools::local::final_answer::{FINAL_ANSWER_TOOL, FinalAnswer};
     use crate::tools::tool::Tool;
@@ -511,7 +509,7 @@ mod tests {
             .expect("send 失败");
         assert_eq!(
             outcome.termination,
-            crate::agent::react::models::Termination::FinalAnswer
+            crate::react::models::Termination::FinalAnswer
         );
     }
 

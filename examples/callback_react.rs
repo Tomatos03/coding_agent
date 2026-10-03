@@ -24,12 +24,12 @@ use async_openai::types::chat::{
     ChatCompletionRequestToolMessageArgs, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestUserMessageArgs, FunctionCall,
 };
-use coding_agent::agent::llm::callback::{Callback, CallbackEvent};
-use coding_agent::agent::llm::models::{LLMClient, Reply};
-use coding_agent::agent::react::models::{DEFAULT_MAX_TURNS, Step};
-use coding_agent::agent::react::runner::ReactLoop;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
+use coding_agent::llm::callback::{Callback, CallbackEvent};
+use coding_agent::llm::models::{LLMClient, Reply};
+use coding_agent::react::models::{DEFAULT_MAX_TURNS, Step};
+use coding_agent::react::runner::ReactLoop;
 use coding_agent::tools::ToolHashMap;
 use coding_agent::tools::local::final_answer::{FINAL_ANSWER_TOOL, FinalAnswer};
 use coding_agent::tools::tool::Tool;

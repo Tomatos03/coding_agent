@@ -20,7 +20,7 @@ ReAct（Reason + Act）主循环的垂直切片：思考 → 行动 → 观察�
 
 | 位置 | 用途 |
 |---|---|
-| `src/agent/llm/models.rs` | `LLMClient`（`complete` / `stream`，唯一具体类型，无 trait）与 `ToolPolicy`、`Reply`——编排层唯一依赖的接口；测试接缝是它的脚本化后端（`LLMClient::scripted`，见 `src/agent/llm/test_support.rs`） |
+| `src/llm/models.rs` | `LLMClient`（`complete` / `stream`，唯一具体类型，无 trait）与 `ToolPolicy`、`Reply`——编排层唯一依赖的接口；测试接缝是它的脚本化后端（`LLMClient::scripted`，见 `src/llm/test_support.rs`） |
 | `src/settings.rs` | `ApprovalPolicy`：`.agents/settings.json`（工作区根目录下）决定**哪些工具要问**；缺文件 = 全放行，加载是调用方的职责 |
 | `src/tools/tool.rs` · `src/tools/local/final_answer/` | `Tool` trait；`final_answer` 的 `execute`（输入即输出）与 `extract_answer`（终止判定） |
 | `src/tools/mod.rs` | `build_tools*()` 构建出的工具表自带 `final_answer`；手工拼表时必须自行注册 |
