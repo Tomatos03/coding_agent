@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 668 478" width="668" height="478" role="img" aria-labelledby="agent-contains-title" font-family="'PingFang SC','Noto Sans SC','Microsoft YaHei',-apple-system,'Segoe UI',sans-serif">
+  <title id="agent-contains-title">Agent 组件的包含关系</title>
+
+  <rect x="0" y="0" width="668" height="478" rx="12" fill="#ffffff"/>
+
+  <!-- Agent -->
+  <rect x="24" y="24" width="620" height="430" rx="12" fill="#ffffff" stroke="#0969da" stroke-width="2.5"/>
+  <text x="44" y="54" font-size="14" font-weight="700" fill="#0550ae">Agent 组件</text>
+  <text x="44" y="72" font-size="11" fill="#0550ae">顶层组件：持有 SessionManager</text>
+
+  <!-- SessionManager -->
+  <rect x="44" y="92" width="580" height="348" rx="10" fill="#fff1e5" stroke="#fd8c73" stroke-width="1.5"/>
+  <text x="60" y="118" font-size="13" font-weight="700" fill="#953800">SessionManager 组件</text>
+  <text x="60" y="134" font-size="10.5" fill="#953800">会话注册表（内存实现）：为每个会话持有常驻 ReactLoop</text>
+
+  <!-- Session -->
+  <rect x="60" y="144" width="548" height="56" rx="8" fill="#ffffff" stroke="#fd8c73" stroke-width="1.5"/>
+  <text x="76" y="164" font-size="12" font-weight="700" fill="#953800" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">Session</text>
+  <text x="152" y="165" font-size="10.5" fill="#953800">会话数据：历史快照 + state；标题 / 消息数 / 挂起态从历史派生</text>
+
+  <!-- ReactLoop -->
+  <rect x="60" y="216" width="548" height="210" rx="10" fill="#dafbe1" stroke="#4ac26b" stroke-width="1.5"/>
+  <text x="76" y="242" font-size="13" font-weight="700" fill="#116329">ReactLoop 组件</text>
+  <text x="76" y="258" font-size="10.5" fill="#116329">编排循环：思考 → 行动 → 观察</text>
+
+  <!-- History -->
+  <rect x="76" y="270" width="148" height="52" rx="8" fill="#ffffff" stroke="#4ac26b" stroke-width="1.5"/>
+  <text x="92" y="292" font-size="11" font-weight="700" fill="#116329" font-family="ui-monospace,SFMono-Regular,Consolas,monospace">History</text>
+  <text x="92" y="308" font-size="10" fill="#57606a">消息序列（只增不减）</text>
+
+  <!-- tool table -->
+  <rect x="236" y="270" width="158" height="52" rx="8" fill="#ffffff" stroke="#4ac26b" stroke-width="1.5"/>
+  <text x="252" y="292" font-size="11" font-weight="700" fill="#116329">工具表 ToolHashMap</text>
+  <text x="252" y="308" font-size="10" fill="#57606a">Tool 接缝：本地 + MCP</text>
+
+  <!-- Confirmer -->
+  <rect x="406" y="270" width="186" height="52" rx="8" fill="#ffffff" stroke="#8c959f" stroke-width="1.5"/>
+  <text x="422" y="292" font-size="11" font-weight="700" fill="#24292f">Confirmer 接缝（可选）</text>
+  <text x="422" y="308" font-size="10" fill="#57606a">Approve / Deny / Pending</text>
+
+  <!-- LLMClient -->
+  <rect x="76" y="336" width="516" height="76" rx="8" fill="#ddf4ff" stroke="#54aeff" stroke-width="1.5"/>
+  <text x="92" y="358" font-size="12" font-weight="700" fill="#0550ae">LLMClient 组件（唯一传输层类型，无 trait）</text>
+  <text x="92" y="380" font-size="10" fill="#0550ae">内置 Callback 链：BeforeSend 正序 / AfterSend 逆序</text>
+  <text x="92" y="398" font-size="10" fill="#0550ae">后端：Live（真实网络）/ Scripted（单测与离线示例）</text>
+</svg>

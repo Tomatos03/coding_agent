@@ -6,7 +6,7 @@
 
 ```
 src/
-├── agent/
+├── agent/            # 顶层组件：传输 / 编排 / 会话 / 顶层 Agent（说明见 agent/README.md）
 │   ├── llm/          # LLM 客户端、provider 配置、并发信号量、消息回调接缝
 │   ├── rag/          # RAG 检索：embed / store / retriever（说明见 rag/README.md）
 │   ├── react/        # ReAct 循环（runner/history/models/approval/context）
