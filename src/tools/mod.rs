@@ -1,10 +1,13 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_openai::types::chat::ChatCompletionTools;
 
 use crate::tools::{
-    local::{FinalAnswer, WebSearch},
+    local::{
+        AnchorRegistry, DEFAULT_FILE_CAP, DeleteFiles, EditFile, FinalAnswer, ListFiles,
+        Permission, ReadFile, SharedAnchors, WebSearch, WriteFile,
+    },
     mcp::{McpConfig, connect_all, load_config, tools_from_connection},
     tool::Tool,
 };
@@ -38,8 +41,11 @@ pub async fn build_tools() -> anyhow::Result<ToolHashMap> {
 /// 直接吃配置构建工具表（不读文件），便于测试与嵌入方复用。
 pub async fn build_tools_with(config: McpConfig) -> anyhow::Result<ToolHashMap> {
     let mut registry = ToolHashMap::new();
-    // 优先创建本地工具
-    let local_count = insert_tools(&mut registry, local_tools());
+    // 优先创建本地工具；文件工具的路径权限在启动时解析一次并固定（workspace 模式）。
+    let permission = Permission::current_dir()?;
+    // 本地文件工具共享同一份锚点账本，`read_file` 的服务记录才能被 `edit_file` 看到。
+    let anchors: SharedAnchors = Arc::new(Mutex::new(AnchorRegistry::new(DEFAULT_FILE_CAP)));
+    let local_count = insert_tools(&mut registry, local_tools(permission, anchors));
 
     let connections = connect_all(&config).await?;
     let mut mcp_count = 0;
@@ -59,9 +65,17 @@ pub async fn build_tools_with(config: McpConfig) -> anyhow::Result<ToolHashMap> 
     Ok(registry)
 }
 
-fn local_tools() -> Vec<Box<dyn Tool>> {
+fn local_tools(permission: Permission, anchors: SharedAnchors) -> Vec<Box<dyn Tool>> {
     // `final_answer` 也在这里注册：它必须出现在发给模型的定义里，收尾轮才能强制调用它。
-    vec![Box::new(WebSearch), Box::new(FinalAnswer)]
+    vec![
+        Box::new(WebSearch),
+        Box::new(FinalAnswer),
+        Box::new(ReadFile::with_anchors(permission.clone(), anchors.clone())),
+        Box::new(WriteFile::with_anchors(permission.clone(), anchors.clone())),
+        Box::new(EditFile::with_anchors(permission.clone(), anchors.clone())),
+        Box::new(DeleteFiles::with_anchors(permission.clone(), anchors)),
+        Box::new(ListFiles::new(permission)),
+    ]
 }
 
 /// 先到先得：重名工具跳过并告警（本地工具先注册，因此本地优先）。
@@ -132,7 +146,27 @@ mod tests {
             registry.contains_key("final_answer"),
             "应注册本地 final_answer"
         );
-        assert_eq!(registry.len(), 2);
+        assert!(registry.contains_key("list_files"), "应注册本地 list_files");
+        assert!(registry.contains_key("read_file"), "应注册本地 read_file");
+        assert!(registry.contains_key("write_file"), "应注册本地 write_file");
+        assert!(registry.contains_key("edit_file"), "应注册本地 edit_file");
+        assert!(
+            registry.contains_key("delete_files"),
+            "应注册本地 delete_files"
+        );
+        assert_eq!(registry.len(), 7);
+    }
+
+    #[tokio::test]
+    async fn every_local_tool_builds_a_definition() {
+        let registry = build_tools_with(McpConfig::default())
+            .await
+            .expect("空配置应成功");
+
+        for (name, tool) in &registry {
+            tool.definition()
+                .unwrap_or_else(|error| panic!("工具 `{name}` 的 definition 构造失败: {error}"));
+        }
     }
 
     #[tokio::test]

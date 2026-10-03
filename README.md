@@ -80,6 +80,48 @@ server 名（即 `mcpServers` 的键）只能包含字母、数字、下划线�
 
 日志统一使用 `target = "mcp"`，便于过滤。
 
+## 本地文件工具
+
+除 `web_search` / `final_answer` 外，本地工具表默认还注册 5 个文件工具。它们能访问哪些
+路径由**文件权限**控制（`src/tools/local/permission.rs` 的 `Permission`），当前固定为
+`workspace` 模式：只能访问**工作区根目录**（固定为进程当前目录，即 agent 的运行目录）
+内的路径，`..`、根外绝对路径、指向根外的符号链接一律拒绝。无边界模式
+`Permission::Full` 保留在类型里，但暂时写死不可选。
+
+| 工具 | 参数 | 行为 |
+|---|---|---|
+| `list_files` | `path`（默认 `.`）、`recursive`（默认 `false`） | 按名字升序列出条目，目录以 `/` 结尾；上限 500 条，超出截断并提示 |
+| `read_file` | `path`、`offset`、`limit`、`line_anchors` | 返回带行号的 UTF-8 文本；`line_anchors=true` 时每行改成 `ANCHOR│内容`，并把展示过的行登记为服务记录；默认最多 2000 行、上限 5000 行，输出上限 256 KiB；非 UTF-8 / 含 NUL 的二进制文件报错 |
+| `write_file` | `path`、`content` | 整文件新建或覆盖，自动创建缺失父目录 |
+| `edit_file` | `command`、`path`、各命令参数 | `command=str_replace` 精确字符串替换（默认要求唯一，`replace_all` 替换全部）；`command=insert` 在第 N 行后插入；`command=replace_anchor` 用行锚点整段替换，并按行指纹做冲突检测。临时文件 + rename 原子写回 |
+| `delete_files` | `paths`（非空字符串数组） | 批量删除文件或目录（目录**递归删除**）；先整体校验再删；不跟随最后一段符号链接（删链接本身） |
+
+`read_file` 传 `line_anchors=true` 时每行输出 `ANCHOR│内容`：锚点由本地工具内的
+**分配式账本**（`src/tools/local/anchor_registry.rs`）分配，先按归一化行内容的
+64 位哈希（`src/utils/hash.rs`）选槽位，冲突时用固定步长线性探测（`src/utils/anchor.rs`）。
+锚点在同一文件内唯一，内容相同的重复行也会拿到不同锚点；一次编辑之后，范围外、
+内容未变的行锚点保持不变。
+
+`read_file` 会把展示过的行登记为**服务记录**（锚点 → 完整行指纹）。`edit_file` 的
+`command=replace_anchor` 用 `remove_from` / `remove_to` 锚点整段替换（空
+`replacement_lines` 即删除），编辑前对范围内每一行比对行指纹：内容变了的行会被拒绝
+（`[E_RANGE_STALE]`）并回传当前范围与新锚点，重试无需重新读取。`str_replace` 仍以
+唯一字符串匹配保证正确性。哈希、归一化与锚点编解码等纯函数都在 `src/utils/` 下。
+
+路径权限集中实现在 `src/tools/local/permission.rs` 的 `Permission`：按模式调度
+（`workspace` 模式的实际边界逻辑在 `src/tools/local/workspace.rs` 的 `Workspace`）。
+工具执行失败会返回 `Err`，由 ReAct 循环压成 Observation 让模型自行纠错，不中断循环。
+
+文件工具各有一个示例（不经过 LLM）。除 `read_file` 读取命令行指定的文件外，其余示例都会在临时工作区里造数据、打印结果、最后清理：
+
+```bash
+cargo run --example list_files
+cargo run --example read_file -- src/lib.rs --limit 5
+cargo run --example write_file
+cargo run --example edit_file
+cargo run --example delete_files
+```
+
 ## ReAct 循环：强制工具调用与 `final_answer`
 
 循环内每一轮都以 `tool_choice=required` 发请求，并显式打开 `parallel_tool_calls`。后者只是**请求**而不是契约：端点可以忽略它（DeepSeek 的参数表里没有这个字段），所以一轮多个 `tool_call` 会被当作正常输入处理。
