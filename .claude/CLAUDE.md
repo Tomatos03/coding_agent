@@ -29,13 +29,14 @@ src/tools/         工具层：spec / execute
 - `src/agent/llm/` 里**不应出现 `use crate::tools::...`**——传输层只收调用方递进来的 `Option<&[ChatCompletionTools]>`，不认识 `ToolHashMap`。
 - `src/agent/llm/` 里不应出现具体领域类型（工具参数、编排层的词汇类型）。
 
-编排层通过 `llm::models::Completer` trait 依赖传输层，而不是直接依赖 `LLMClient` 这个类型——所以 `ReactLoop` 的全部逻辑可以离线测试。
+编排层只依赖 `llm::models::LLMClient` 这**一个具体类型**（没有 trait，也没有 `LLMClient` / `CallbackCompleter` 之类的实现类型）：它内部装配私有 `Live`（真实网络）或脚本化后端，所以 `ReactLoop` 的全部逻辑可以离线测试。
 
 ## 模块职责
 
 | 模块 | 职责 |
 |---|---|
-| `src/agent/llm/models.rs` | `LLMClient`：只持有 model 名与 `async_openai::Client`。`Completer` trait 有 `complete`（一次性）与 `stream`（逐 token 回调）两个方法，都接收 `ToolPolicy`（`Auto` / `Required` / `Force(工具名)`，请求级 `tool_choice`）并返回领域类型 `Reply`（`content` + `tool_calls`）。端点以 400 拒绝 `tool_choice` 时用粘性 `AtomicBool` 标记并降级为 `Auto` 重发一次。**从具体类型调用 trait 方法要 `use Completer`**。`Completer` 同时是编排层唯一依赖的接口与测试的接缝 |
+| `src/agent/llm/models.rs` | `LLMClient`：**唯一**的传输层类型（无 trait）。内部后端二选一——私有 `Live`（model 名 + `async_openai::Client`，端点以 400 拒绝 `tool_choice` 时用粘性 `AtomicBool` 标记并降级为 `Auto` 重发一次）或测试 / 离线示例的脚本化后端。`complete`（一次性）与 `stream`（逐 token 回调）都接收 `ToolPolicy`（`Auto` / `Required` / `Force(工具名)`，请求级 `tool_choice`）并返回领域类型 `Reply`（`content` + `tool_calls`）；请求前后的回调链也挂在这一层（`with_callbacks`，派发见 `src/agent/llm/callback.rs`） |
+| `src/agent/llm/test_support.rs` | 脚本化后端与请求快照：`LLMClient::scripted(replies)` 挂载，逐次记录 messages / 工具名 / `ToolPolicy`；单测与离线示例据此离线驱动并断言整条链路 |
 | `src/agent/llm/provider.rs` | provider 选择、`client_config()`、模型 ID 读取、schema 降级提示 |
 | `src/agent/llm/semaphore.rs` | 进程级并发闸门（3 permits），**由调用方负责获取** |
 | `src/agent/react/runner.rs` | `ReactLoop`：循环推进、工具派发、终止判定。`run` 同时接收 `on_step` 与 `on_token` 两个回调（原 `run_stream` 已并入 `run`） |
@@ -65,7 +66,7 @@ src/tools/         工具层：spec / execute
 | `web_search` | 裸 HTTP 打 Tavily + 响应解析 |
 | `tool_exec` | 不走 LLM，直接验证「注册表 → trait 对象 → execute」 |
 | `mcp_probe` | 连接一个 stdio MCP server，打印/调用适配出的工具（默认用 `tests/fixtures/fake_mcp_server.py`） |
-| `mcp_react` | 端到端：用户提问 → ReAct 循环 → 调用 MCP 工具 → 汇总回答（脚本化 `Completer`，无需 LLM 凭证） |
+| `mcp_react` | 端到端：用户提问 → ReAct 循环 → 调用 MCP 工具 → 汇总回答（脚本化 `LLMClient`，无需 LLM 凭证） |
 | `mcp_chat` | 真实 LLM + MCP：从 `mcp.json` 加载工具，模型自主决定是否调用（需要凭证与 `mcp.json`） |
 | `rag_chat` | 端到端检索：ingest 若干文本 → 提问 → 打印 top-k 与 score（需 `EMBEDDING_*` 凭证） |
 

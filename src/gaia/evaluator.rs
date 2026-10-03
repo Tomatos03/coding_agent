@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::agent::llm::models::Completer;
+use crate::agent::llm::models::LLMClient;
 use crate::gaia::{
     models::{GaiaEvalResult, GaiaMode, GaiaOutput, GaiaRow},
     solver::{
@@ -24,16 +24,12 @@ pub async fn evaluate_gaia_without_tools(problem: GaiaRow, model_id: &str) -> Ga
 pub async fn evaluate_gaia_with_tools(
     problem: GaiaRow,
     model_id: &str,
-    completer: Arc<dyn Completer>,
+    llm: Arc<LLMClient>,
     tools: ToolHashMap,
 ) -> GaiaEvalResult {
-    let result = solve_gaia_question_with_tools_retry(
-        &completer,
-        &tools,
-        GAIA_TOOLS_PROMPT,
-        &problem.question,
-    )
-    .await;
+    let result =
+        solve_gaia_question_with_tools_retry(&llm, &tools, GAIA_TOOLS_PROMPT, &problem.question)
+            .await;
 
     let tool_calls = result.as_ref().ok().map(|(_, calls)| *calls);
     let output = result.map(|(output, _)| output);
@@ -77,63 +73,21 @@ fn into_eval_result(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use async_openai::types::chat::{
-        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-        ChatCompletionRequestMessage, FunctionCall,
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, FunctionCall,
     };
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::agent::llm::models::{Reply, ToolPolicy};
+    use crate::agent::llm::models::Reply;
     use crate::tools::local::final_answer::{FINAL_ANSWER_TOOL, FinalAnswer};
     use crate::tools::tool::Tool;
 
-    struct ScriptedCompleter {
-        replies: Mutex<Vec<Reply>>,
-    }
-
-    impl ScriptedCompleter {
-        fn new(replies: Vec<Reply>) -> Arc<Self> {
-            Arc::new(Self {
-                replies: Mutex::new(replies),
-            })
-        }
-
-        fn next(&self) -> anyhow::Result<Reply> {
-            let mut replies = self.replies.lock().expect("锁被毒化");
-            if replies.is_empty() {
-                anyhow::bail!("预置响应已用尽");
-            }
-            Ok(replies.remove(0))
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Completer for ScriptedCompleter {
-        async fn complete(
-            &self,
-            _messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
-            _policy: ToolPolicy,
-        ) -> anyhow::Result<Reply> {
-            self.next()
-        }
-
-        async fn stream(
-            &self,
-            _messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
-            _policy: ToolPolicy,
-            on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
-        ) -> anyhow::Result<Reply> {
-            let reply = self.next()?;
-            if !reply.content.is_empty() {
-                on_token(&reply.content);
-            }
-            Ok(reply)
-        }
+    /// 脚本化 `LLMClient`：按预置回复队列驱动带工具的评测。
+    fn scripted(replies: Vec<Reply>) -> Arc<LLMClient> {
+        Arc::new(LLMClient::scripted(replies))
     }
 
     struct EchoTool;
@@ -215,9 +169,9 @@ mod tests {
 
     #[tokio::test]
     async fn with_tools_runs_loop_and_counts_calls() {
-        let completer = ScriptedCompleter::new(vec![tool_reply(), answer_reply("Paris")]);
+        let llm = scripted(vec![tool_reply(), answer_reply("Paris")]);
 
-        let result = evaluate_gaia_with_tools(problem(), "m", completer, tools()).await;
+        let result = evaluate_gaia_with_tools(problem(), "m", llm, tools()).await;
 
         assert!(result.correct);
         assert_eq!(result.mode, GaiaMode::WithTools);
@@ -228,9 +182,9 @@ mod tests {
     #[tokio::test]
     async fn final_answer_is_not_counted_as_a_tool_call() {
         // 模型全程没碰真工具，只靠 final_answer 收尾：口径应报 0 次工具使用。
-        let completer = ScriptedCompleter::new(vec![answer_reply("Paris")]);
+        let llm = scripted(vec![answer_reply("Paris")]);
 
-        let result = evaluate_gaia_with_tools(problem(), "m", completer, tools()).await;
+        let result = evaluate_gaia_with_tools(problem(), "m", llm, tools()).await;
 
         assert!(result.correct);
         assert_eq!(

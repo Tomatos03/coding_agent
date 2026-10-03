@@ -1,7 +1,7 @@
 use coding_agent::{
     agent::{
         llm::{
-            models::{Completer, LLMClient, ToolPolicy},
+            models::{LLMClient, ToolPolicy},
             semaphore::get_semaphore,
         },
         react::history::History,
@@ -26,8 +26,8 @@ async fn main() -> anyhow::Result<()> {
             history.system(SYSTEM_PROMPT)?;
             history.user(&format!("我最喜欢的数字是 {i}，请围绕它规划一件小事。"))?;
 
-            let client = LLMClient::new();
-            let reply = client
+            let llm = LLMClient::new();
+            let reply = llm
                 .stream(
                     history.as_slice(),
                     None,

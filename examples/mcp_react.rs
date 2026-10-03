@@ -1,6 +1,6 @@
 //! 端到端示例：用户提问 → ReAct 循环 → 调用 MCP 工具（先被拒绝、后获批准）→ 汇总回答。
 //!
-//! 用脚本化的 `Completer` + `Confirmer` 代替真实 LLM 与人工确认，**无需任何凭证、可离线运行**：
+//! 用脚本化的 `LLMClient` + `Confirmer` 代替真实 LLM 与人工确认，**无需任何凭证、可离线运行**：
 //! - 第 1 轮：模型请求调用 MCP 工具 `{server}__echo`，审批策略判 ask，脚本确认方**拒绝**；
 //!   拒绝被压成 Observation，循环不中断；
 //! - 第 2 轮：模型换参数重试，脚本确认方**批准**，工具真实执行；
@@ -14,66 +14,18 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_openai::types::chat::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
-    FunctionCall,
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, FunctionCall,
 };
-use coding_agent::agent::llm::models::{Completer, Reply, ToolPolicy};
+use coding_agent::agent::llm::models::{LLMClient, Reply};
 use coding_agent::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
 use coding_agent::agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::agent::react::runner::ReactLoop;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
 use coding_agent::settings::{ApprovalAction, ApprovalPolicy, ApprovalRule};
+use coding_agent::tools::build_tools_with;
 use coding_agent::tools::local::final_answer::FINAL_ANSWER_TOOL;
 use coding_agent::tools::mcp::{McpConfig, McpServerConfig};
-use coding_agent::tools::{ToolHashMap, build_tools_with};
-
-/// 按预置队列依次返回回复的 `Completer`，用来替代真实 LLM。
-struct ScriptedCompleter {
-    replies: Mutex<VecDeque<Reply>>,
-}
-
-impl ScriptedCompleter {
-    fn new(replies: Vec<Reply>) -> Self {
-        Self {
-            replies: Mutex::new(replies.into()),
-        }
-    }
-
-    fn next(&self) -> anyhow::Result<Reply> {
-        self.replies
-            .lock()
-            .expect("脚本锁被毒化")
-            .pop_front()
-            .ok_or_else(|| anyhow::anyhow!("预置回复已用尽"))
-    }
-}
-
-#[async_trait::async_trait]
-impl Completer for ScriptedCompleter {
-    async fn complete(
-        &self,
-        _messages: &[ChatCompletionRequestMessage],
-        _tools: Option<&ToolHashMap>,
-        _policy: ToolPolicy,
-    ) -> anyhow::Result<Reply> {
-        self.next()
-    }
-
-    async fn stream(
-        &self,
-        _messages: &[ChatCompletionRequestMessage],
-        _tools: Option<&ToolHashMap>,
-        _policy: ToolPolicy,
-        on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
-    ) -> anyhow::Result<Reply> {
-        let reply = self.next()?;
-        if !reply.content.is_empty() {
-            on_token(&reply.content);
-        }
-        Ok(reply)
-    }
-}
 
 /// 脚本化确认方：按预置队列依次给出决策，并打印每次询问（替代人工确认）。
 struct ScriptedConfirmer {
@@ -179,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
     let arguments = serde_json::json!({ "text": "hello from agent" }).to_string();
     let retry_arguments = serde_json::json!({ "text": "hello again, after denial" }).to_string();
 
-    let completer = ScriptedCompleter::new(vec![
+    let llm = LLMClient::scripted(vec![
         // 第 1 轮：模型决定调用 MCP 工具，脚本确认方拒绝——拒绝被压成 Observation。
         mcp_tool_call("call_mcp_1", &echo_tool, &arguments),
         // 第 2 轮：模型换参数重试，脚本确认方批准，工具真实执行。
@@ -212,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let confirmer = ScriptedConfirmer::new(vec![Decision::Deny, Decision::Approve]);
 
-    let mut agent = ReactLoop::new(Arc::new(completer), tools, SYSTEM_PROMPT, DEFAULT_MAX_TURNS)?
+    let mut agent = ReactLoop::new(Arc::new(llm), tools, SYSTEM_PROMPT, DEFAULT_MAX_TURNS)?
         .with_approval_policy(policy)
         .with_confirmer(Arc::new(confirmer));
 

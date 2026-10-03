@@ -6,7 +6,7 @@ use async_openai::types::chat::{
 };
 use backon::{ExponentialBuilder, Retryable};
 
-use crate::agent::llm::{models::Completer, provider};
+use crate::agent::llm::{models::LLMClient, provider};
 use crate::agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use crate::agent::react::runner::ReactLoop;
 use crate::gaia::models::GaiaOutput;
@@ -46,13 +46,13 @@ pub async fn solve_gaia_question_with_retry(
 }
 
 pub async fn solve_gaia_question_with_tools_retry(
-    completer: &Arc<dyn Completer>,
+    llm: &Arc<LLMClient>,
     tools: &ToolHashMap,
     system: &str,
     prompt: &str,
 ) -> anyhow::Result<(GaiaOutput, usize)> {
     let op = || async {
-        solve_gaia_question_with_tools(completer.clone(), tools.clone(), system, prompt).await
+        solve_gaia_question_with_tools(llm.clone(), tools.clone(), system, prompt).await
     };
     op.retry(ExponentialBuilder::default().with_max_times(3))
         .await
@@ -63,12 +63,12 @@ pub async fn solve_gaia_question_with_tools_retry(
 /// 调用次数用于判断「带工具」这一组成绩是否真的用上了工具——模型可能全程
 /// 直接作答，此时与「不带工具」的差异只剩输出格式，不代表工具起了作用。
 pub async fn solve_gaia_question_with_tools(
-    completer: Arc<dyn Completer>,
+    llm: Arc<LLMClient>,
     tools: ToolHashMap,
     system: &str,
     prompt: &str,
 ) -> anyhow::Result<(GaiaOutput, usize)> {
-    let mut agent = ReactLoop::new(completer, tools, system, DEFAULT_MAX_TURNS)?;
+    let mut agent = ReactLoop::new(llm, tools, system, DEFAULT_MAX_TURNS)?;
 
     let mut tool_calls = 0usize;
     let outcome = agent

@@ -1,9 +1,10 @@
 //! 消息发送前后的回调接缝。
 //!
-//! 用一个透明装饰器 [`CallbackCompleter`] 包住任意 [`Completer`]，在每轮请求发出前
-//! **正序**派发 [`CallbackEvent::BeforeSend`]、响应返回后**逆序**派发
-//! [`CallbackEvent::AfterSend`]。装饰器对调用方（`ReactLoop`、GAIA、examples）完全透明：
-//! 不注册回调、不包装它时，全链路与没有这层时逐字节一致。
+//! 回调链直接挂在唯一的具体类型 [`LLMClient`](super::models::LLMClient) 上：注册用
+//! [`LLMClient::with_callbacks`](super::models::LLMClient::with_callbacks)，派发在
+//! [`prepare`] / [`conclude`] 里完成——每轮请求发出前**正序**派发
+//! [`CallbackEvent::BeforeSend`]、响应返回后**逆序**派发 [`CallbackEvent::AfterSend`]。
+//! 不注册回调时，全链路与没有这层逐字节一致。
 //!
 //! 两个时机的语义差别是理解这个模块的关键：
 //!
@@ -20,8 +21,7 @@ use std::sync::Arc;
 
 use async_openai::types::chat::ChatCompletionRequestMessage;
 
-use super::models::{Completer, Reply, ToolPolicy};
-use crate::tools::ToolHashMap;
+use super::models::Reply;
 
 /// 一次挂点时机携带的一切。每个变体只带该时机「合法可改」的东西，能力约束做进类型：
 /// 请求还没发出去时改消息有意义；响应已经回来时消息只读、回复可改。
@@ -63,83 +63,36 @@ pub trait Callback: Send + Sync {
     async fn call(&self, event: CallbackEvent<'_>) -> anyhow::Result<()>;
 }
 
-/// 透明装饰器：包住任意 [`Completer`]，在请求前后派发回调链。
-///
-/// 不注册回调 / 不包装它时，全链路与现在完全一致（零行为变化、零成本）。
-pub struct CallbackCompleter {
-    inner: Arc<dyn Completer>,
-    callbacks: Vec<Arc<dyn Callback>>,
-}
-
-impl CallbackCompleter {
-    /// `callbacks` 按注册顺序执行：`BeforeSend` 正序，`AfterSend` 逆序（洋葱模型）。
-    pub fn new(inner: Arc<dyn Completer>, callbacks: Vec<Arc<dyn Callback>>) -> Self {
-        Self { inner, callbacks }
-    }
-
-    /// 克隆 + 正序派发 `BeforeSend`。返回的 `Vec` 就是实际发出去的版本。
-    async fn prepare(
-        &self,
-        messages: &[ChatCompletionRequestMessage],
-    ) -> anyhow::Result<Vec<ChatCompletionRequestMessage>> {
-        let mut messages = messages.to_vec();
-        for callback in &self.callbacks {
-            callback
-                .call(CallbackEvent::BeforeSend {
-                    messages: &mut messages,
-                })
-                .await?;
-        }
-        Ok(messages)
-    }
-
-    /// 逆序派发 `AfterSend`（洋葱模型）。
-    ///
-    /// `messages` 是实际发出去的版本，仅供观察；改回复才是这里的副作用。
-    async fn conclude(
-        &self,
-        messages: &[ChatCompletionRequestMessage],
-        reply: &mut Reply,
-    ) -> anyhow::Result<()> {
-        for callback in self.callbacks.iter().rev() {
-            callback
-                .call(CallbackEvent::AfterSend { messages, reply })
-                .await?;
-        }
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl Completer for CallbackCompleter {
-    async fn complete(
-        &self,
-        messages: &[ChatCompletionRequestMessage],
-        tools: Option<&ToolHashMap>,
-        policy: ToolPolicy,
-    ) -> anyhow::Result<Reply> {
-        let messages = self.prepare(messages).await?;
-        let mut reply = self.inner.complete(&messages, tools, policy).await?;
-        self.conclude(&messages, &mut reply).await?;
-        Ok(reply)
-    }
-
-    async fn stream(
-        &self,
-        messages: &[ChatCompletionRequestMessage],
-        tools: Option<&ToolHashMap>,
-        policy: ToolPolicy,
-        on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
-    ) -> anyhow::Result<Reply> {
-        let messages = self.prepare(messages).await?;
-        // `on_token` 直通内层：token 级改写不在接缝范围内（属渲染层的事）。
-        let mut reply = self
-            .inner
-            .stream(&messages, tools, policy, on_token)
+/// 克隆 + 正序派发 `BeforeSend`。返回的 `Vec` 就是实际发出去的版本。
+pub(crate) async fn prepare(
+    callbacks: &[Arc<dyn Callback>],
+    messages: &[ChatCompletionRequestMessage],
+) -> anyhow::Result<Vec<ChatCompletionRequestMessage>> {
+    let mut messages = messages.to_vec();
+    for callback in callbacks {
+        callback
+            .call(CallbackEvent::BeforeSend {
+                messages: &mut messages,
+            })
             .await?;
-        self.conclude(&messages, &mut reply).await?;
-        Ok(reply)
     }
+    Ok(messages)
+}
+
+/// 逆序派发 `AfterSend`（洋葱模型）。
+///
+/// `messages` 是实际发出去的版本，仅供观察；改回复才是这里的副作用。
+pub(crate) async fn conclude(
+    callbacks: &[Arc<dyn Callback>],
+    messages: &[ChatCompletionRequestMessage],
+    reply: &mut Reply,
+) -> anyhow::Result<()> {
+    for callback in callbacks.iter().rev() {
+        callback
+            .call(CallbackEvent::AfterSend { messages, reply })
+            .await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -151,6 +104,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::agent::llm::models::{LLMClient, ToolPolicy};
 
     /// 构造一条 user 消息，供测试注入 / 断言。
     fn user(text: &str) -> ChatCompletionRequestMessage {
@@ -166,50 +120,12 @@ mod tests {
         serde_json::to_string(message).expect("序列化消息失败")
     }
 
-    /// 假内层传输层：记录每次收到的消息，返回预置回复。
-    struct RecordingCompleter {
-        seen: Mutex<Vec<Vec<ChatCompletionRequestMessage>>>,
-        reply: Reply,
-    }
-
-    impl RecordingCompleter {
-        fn new(reply: Reply) -> Arc<Self> {
-            Arc::new(Self {
-                seen: Mutex::new(Vec::new()),
-                reply,
-            })
-        }
-
-        fn seen(&self) -> Vec<Vec<ChatCompletionRequestMessage>> {
-            self.seen.lock().expect("锁被毒化").clone()
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Completer for RecordingCompleter {
-        async fn complete(
-            &self,
-            messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
-            _policy: ToolPolicy,
-        ) -> anyhow::Result<Reply> {
-            self.seen.lock().expect("锁被毒化").push(messages.to_vec());
-            Ok(self.reply.clone())
-        }
-
-        async fn stream(
-            &self,
-            messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
-            _policy: ToolPolicy,
-            on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
-        ) -> anyhow::Result<Reply> {
-            self.seen.lock().expect("锁被毒化").push(messages.to_vec());
-            if !self.reply.content.is_empty() {
-                on_token(&self.reply.content);
-            }
-            Ok(self.reply.clone())
-        }
+    /// 脚本后端每次实际收到的消息（已过回调链）。
+    fn seen(llm: &LLMClient) -> Vec<Vec<ChatCompletionRequestMessage>> {
+        llm.scripted_requests()
+            .into_iter()
+            .map(|request| request.messages)
+            .collect()
     }
 
     /// 在 `BeforeSend` 往尾部追加一条注入消息。
@@ -327,32 +243,25 @@ mod tests {
 
     #[tokio::test]
     async fn before_send_injection_reaches_inner() {
-        let inner = RecordingCompleter::new(Reply::default());
-        let completer =
-            CallbackCompleter::new(inner.clone(), vec![Arc::new(AppendMarker("INJECTED"))]);
+        let llm = LLMClient::scripted(vec![Reply::default()])
+            .with_callbacks(vec![Arc::new(AppendMarker("INJECTED"))]);
         let base = vec![user("hi")];
 
-        completer
-            .complete(&base, None, ToolPolicy::Auto)
+        llm.complete(&base, None, ToolPolicy::Auto)
             .await
             .expect("complete 应成功");
 
-        let seen = inner.seen();
+        let seen = seen(&llm);
         assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].len(), 2, "注入后内层应收到 2 条消息");
+        assert_eq!(seen[0].len(), 2, "注入后后端应收到 2 条消息");
         assert!(
             text(&seen[0][1]).contains("INJECTED"),
-            "注入的消息应送达内层且位于尾部"
+            "注入的消息应送达后端且位于尾部"
         );
     }
 
     #[tokio::test]
     async fn after_send_rewrites_reply() {
-        let inner = RecordingCompleter::new(Reply {
-            content: "raw".into(),
-            tool_calls: Vec::new(),
-        });
-
         struct Rewrite;
         #[async_trait::async_trait]
         impl Callback for Rewrite {
@@ -364,8 +273,12 @@ mod tests {
             }
         }
 
-        let completer = CallbackCompleter::new(inner, vec![Arc::new(Rewrite)]);
-        let reply = completer
+        let llm = LLMClient::scripted(vec![Reply {
+            content: "raw".into(),
+            tool_calls: Vec::new(),
+        }])
+        .with_callbacks(vec![Arc::new(Rewrite)]);
+        let reply = llm
             .complete(&[user("hi")], None, ToolPolicy::Auto)
             .await
             .expect("complete 应成功");
@@ -375,13 +288,12 @@ mod tests {
 
     #[tokio::test]
     async fn empty_callbacks_is_passthrough() {
-        let inner = RecordingCompleter::new(Reply {
+        let llm = LLMClient::scripted(vec![Reply {
             content: "same".into(),
             tool_calls: Vec::new(),
-        });
-        let completer = CallbackCompleter::new(inner, Vec::new());
+        }]);
 
-        let reply = completer
+        let reply = llm
             .complete(&[user("hi")], None, ToolPolicy::Auto)
             .await
             .expect("complete 应成功");
@@ -393,25 +305,21 @@ mod tests {
     async fn onion_order_and_cross_visibility() {
         let trace = Arc::new(Mutex::new(Vec::new()));
         let saw_outer = Arc::new(Mutex::new(false));
-        let inner = RecordingCompleter::new(Reply {
+        let llm = LLMClient::scripted(vec![Reply {
             content: "raw".into(),
             tool_calls: Vec::new(),
-        });
+        }])
+        .with_callbacks(vec![
+            Arc::new(Outer {
+                trace: trace.clone(),
+            }),
+            Arc::new(Inner {
+                trace: trace.clone(),
+                saw_outer: saw_outer.clone(),
+            }),
+        ]);
 
-        let completer = CallbackCompleter::new(
-            inner,
-            vec![
-                Arc::new(Outer {
-                    trace: trace.clone(),
-                }),
-                Arc::new(Inner {
-                    trace: trace.clone(),
-                    saw_outer: saw_outer.clone(),
-                }),
-            ],
-        );
-
-        let reply = completer
+        let reply = llm
             .complete(&[user("hi")], None, ToolPolicy::Auto)
             .await
             .expect("complete 应成功");
@@ -432,28 +340,27 @@ mod tests {
 
     #[tokio::test]
     async fn before_send_error_aborts_without_calling_inner() {
-        let inner = RecordingCompleter::new(Reply::default());
-        let completer = CallbackCompleter::new(inner.clone(), vec![Arc::new(FailBefore)]);
+        let llm =
+            LLMClient::scripted(vec![Reply::default()]).with_callbacks(vec![Arc::new(FailBefore)]);
 
-        let result = completer
-            .complete(&[user("hi")], None, ToolPolicy::Auto)
-            .await;
+        let result = llm.complete(&[user("hi")], None, ToolPolicy::Auto).await;
 
         assert!(result.is_err(), "BeforeSend 报错应中止整个请求");
-        assert!(inner.seen().is_empty(), "内层不应被调用（fail-closed）");
+        assert!(
+            llm.scripted_requests().is_empty(),
+            "后端不应被调用（fail-closed）"
+        );
     }
 
     #[tokio::test]
     async fn after_send_error_propagates() {
-        let inner = RecordingCompleter::new(Reply {
+        let llm = LLMClient::scripted(vec![Reply {
             content: "raw".into(),
             tool_calls: Vec::new(),
-        });
-        let completer = CallbackCompleter::new(inner, vec![Arc::new(FailAfter)]);
+        }])
+        .with_callbacks(vec![Arc::new(FailAfter)]);
 
-        let result = completer
-            .complete(&[user("hi")], None, ToolPolicy::Auto)
-            .await;
+        let result = llm.complete(&[user("hi")], None, ToolPolicy::Auto).await;
 
         assert!(result.is_err(), "即便回复已到手，AfterSend 报错也要传播");
     }
@@ -461,18 +368,15 @@ mod tests {
     #[tokio::test]
     async fn pass_through_template_participates_in_full_chain() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let inner = RecordingCompleter::new(Reply {
+        let llm = LLMClient::scripted(vec![Reply {
             content: "untouched".into(),
             tool_calls: Vec::new(),
-        });
-        let completer = CallbackCompleter::new(
-            inner,
-            vec![Arc::new(PassThrough {
-                events: events.clone(),
-            })],
-        );
+        }])
+        .with_callbacks(vec![Arc::new(PassThrough {
+            events: events.clone(),
+        })]);
 
-        let reply = completer
+        let reply = llm
             .complete(&[user("hi")], None, ToolPolicy::Auto)
             .await
             .expect("complete 应成功");
@@ -488,19 +392,16 @@ mod tests {
     #[tokio::test]
     async fn stream_dispatches_both_events_and_leaves_tokens() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let inner = RecordingCompleter::new(Reply {
+        let llm = LLMClient::scripted(vec![Reply {
             content: "hello".into(),
             tool_calls: Vec::new(),
-        });
-        let completer = CallbackCompleter::new(
-            inner.clone(),
-            vec![Arc::new(PassThrough {
-                events: events.clone(),
-            })],
-        );
+        }])
+        .with_callbacks(vec![Arc::new(PassThrough {
+            events: events.clone(),
+        })]);
 
         let mut tokens: Vec<String> = Vec::new();
-        let reply = completer
+        let reply = llm
             .stream(&[user("hi")], None, ToolPolicy::Auto, &mut |token| {
                 tokens.push(token.to_owned());
             })
@@ -513,7 +414,7 @@ mod tests {
             "stream 路径同样派发两种事件"
         );
         assert_eq!(tokens, vec!["hello".to_owned()], "on_token 直通、不受影响");
-        assert!(inner.seen().len() == 1, "内层应收到注入后的请求");
+        assert!(seen(&llm).len() == 1, "后端应收到一次请求");
         assert_eq!(reply.content, "hello");
     }
 }

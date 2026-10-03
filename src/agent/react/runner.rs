@@ -5,7 +5,7 @@ use async_openai::types::chat::{
 };
 use tracing::info;
 
-use crate::agent::llm::models::{Completer, Reply, ToolPolicy};
+use crate::agent::llm::models::{LLMClient, Reply, ToolPolicy};
 use crate::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
 use crate::agent::react::context::{Event, EventName, ExecuteContext, Role, Status};
 use crate::agent::react::history::{History, pending_batch};
@@ -15,7 +15,7 @@ use crate::tools::ToolHashMap;
 use crate::tools::local::final_answer::{self, FINAL_ANSWER_TOOL};
 
 pub struct ReactLoop {
-    completer: Arc<dyn Completer>,
+    llm: Arc<LLMClient>,
     tools: ToolHashMap,
     history: History,
     max_turns: usize,
@@ -28,14 +28,14 @@ impl ReactLoop {
     /// 缺失时服务端会因函数未声明而拒绝。用 [`crate::tools::build_tools`] 构建的
     /// 工具表天然满足；手工拼表的调用方需自行注册。
     pub fn new(
-        completer: Arc<dyn Completer>,
+        llm: Arc<LLMClient>,
         tools: ToolHashMap,
         system_prompt: &str,
         max_turns: usize,
     ) -> anyhow::Result<Self> {
         let mut history = History::new();
         history.system(system_prompt)?;
-        Self::from_history(history, completer, tools, max_turns)
+        Self::from_history(history, llm, tools, max_turns)
     }
 
     /// 带着既有历史构造（[`Self::new`] 是它的特例：历史里只有 system）。
@@ -43,12 +43,12 @@ impl ReactLoop {
     /// session 层用它恢复冷会话：**历史即事实**，system prompt 也以历史里的为准。
     pub fn from_history(
         history: History,
-        completer: Arc<dyn Completer>,
+        llm: Arc<LLMClient>,
         tools: ToolHashMap,
         max_turns: usize,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            completer,
+            llm,
             tools,
             history,
             max_turns,
@@ -427,7 +427,7 @@ impl ReactLoop {
         on_token: &mut (dyn for<'x> FnMut(usize, &'x str) + Send),
     ) -> anyhow::Result<Reply> {
         let reply = self
-            .completer
+            .llm
             .stream(
                 self.history.as_slice(),
                 Some(&self.tools),
@@ -481,7 +481,7 @@ impl ReactLoop {
         let tools = finalize_tools(&self.tools);
 
         let reply = self
-            .completer
+            .llm
             .stream(
                 self.history.as_slice(),
                 tools.as_ref(),
@@ -678,7 +678,7 @@ mod tests {
     };
     use serde_json::{Value, json};
 
-    use crate::agent::llm::callback::{Callback, CallbackCompleter, CallbackEvent};
+    use crate::agent::llm::callback::{Callback, CallbackEvent};
     use crate::agent::llm::models::{Reply, ToolPolicy};
     use crate::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
     use crate::agent::react::models::DEFAULT_MAX_TURNS;
@@ -763,88 +763,33 @@ mod tests {
             .collect()
     }
 
-    struct ScriptedCompleter {
-        replies: Mutex<Vec<Reply>>,
-        policies: Mutex<Vec<ToolPolicy>>,
-        /// 每次请求实际暴露的工具名（排序后），用来断言收尾轮的裁剪。
-        tool_names: Mutex<Vec<Vec<String>>>,
-        /// 每次请求实际收到的消息（已过回调链），用来钉住「线上 ≠ 历史」。
-        messages: Mutex<Vec<Vec<ChatCompletionRequestMessage>>>,
+    /// 脚本化 `LLMClient`：按预置回复队列驱动循环，并记录每次请求。
+    fn scripted(replies: Vec<Reply>) -> Arc<LLMClient> {
+        Arc::new(LLMClient::scripted(replies))
     }
 
-    impl ScriptedCompleter {
-        fn new(replies: Vec<Reply>) -> Arc<Self> {
-            Arc::new(Self {
-                replies: Mutex::new(replies),
-                policies: Mutex::new(Vec::new()),
-                tool_names: Mutex::new(Vec::new()),
-                messages: Mutex::new(Vec::new()),
-            })
-        }
-
-        fn next(
-            &self,
-            messages: &[ChatCompletionRequestMessage],
-            tools: Option<&ToolHashMap>,
-            policy: &ToolPolicy,
-            on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
-        ) -> anyhow::Result<Reply> {
-            self.policies.lock().expect("锁被毒化").push(policy.clone());
-            self.messages
-                .lock()
-                .expect("锁被毒化")
-                .push(messages.to_vec());
-
-            let mut names: Vec<String> = tools
-                .map(|tools| tools.keys().cloned().collect())
-                .unwrap_or_default();
-            names.sort();
-            self.tool_names.lock().expect("锁被毒化").push(names);
-
-            let mut replies = self.replies.lock().expect("锁被毒化");
-            if replies.is_empty() {
-                anyhow::bail!("预置响应已用尽");
-            }
-            let reply = replies.remove(0);
-            if !reply.content.is_empty() {
-                on_token(&reply.content);
-            }
-            Ok(reply)
-        }
-
-        fn policies(&self) -> Vec<ToolPolicy> {
-            self.policies.lock().expect("锁被毒化").clone()
-        }
-
-        fn tool_names(&self) -> Vec<Vec<String>> {
-            self.tool_names.lock().expect("锁被毒化").clone()
-        }
-
-        fn messages(&self) -> Vec<Vec<ChatCompletionRequestMessage>> {
-            self.messages.lock().expect("锁被毒化").clone()
-        }
+    /// 每次请求实际用的 `tool_choice` 策略。
+    fn policies(llm: &LLMClient) -> Vec<ToolPolicy> {
+        llm.scripted_requests()
+            .into_iter()
+            .map(|request| request.policy)
+            .collect()
     }
 
-    #[async_trait::async_trait]
-    impl Completer for ScriptedCompleter {
-        async fn complete(
-            &self,
-            messages: &[ChatCompletionRequestMessage],
-            tools: Option<&ToolHashMap>,
-            policy: ToolPolicy,
-        ) -> anyhow::Result<Reply> {
-            self.next(messages, tools, &policy, &mut |_| {})
-        }
+    /// 每次请求实际暴露的工具名（排序后），用来断言收尾轮的裁剪。
+    fn tool_names(llm: &LLMClient) -> Vec<Vec<String>> {
+        llm.scripted_requests()
+            .into_iter()
+            .map(|request| request.tool_names)
+            .collect()
+    }
 
-        async fn stream(
-            &self,
-            messages: &[ChatCompletionRequestMessage],
-            tools: Option<&ToolHashMap>,
-            policy: ToolPolicy,
-            on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
-        ) -> anyhow::Result<Reply> {
-            self.next(messages, tools, &policy, on_token)
-        }
+    /// 每次请求实际收到的消息（已过回调链），用来钉住「线上 ≠ 历史」。
+    fn transport_messages(llm: &LLMClient) -> Vec<Vec<ChatCompletionRequestMessage>> {
+        llm.scripted_requests()
+            .into_iter()
+            .map(|request| request.messages)
+            .collect()
     }
 
     /// 执行次数探针：用来断言「不该执行」的调用确实没有执行。
@@ -936,19 +881,16 @@ mod tests {
         }
     }
 
-    fn build(completer: Arc<dyn Completer>) -> ReactLoop {
-        build_with_probe(completer, DEFAULT_MAX_TURNS).0
+    fn build(llm: Arc<LLMClient>) -> ReactLoop {
+        build_with_probe(llm, DEFAULT_MAX_TURNS).0
     }
 
-    fn build_with_max_turns(completer: Arc<dyn Completer>, max_turns: usize) -> ReactLoop {
-        build_with_probe(completer, max_turns).0
+    fn build_with_max_turns(llm: Arc<LLMClient>, max_turns: usize) -> ReactLoop {
+        build_with_probe(llm, max_turns).0
     }
 
     /// 与 [`build`] 相同，但额外返回 echo 的执行次数探针。
-    fn build_with_probe(
-        completer: Arc<dyn Completer>,
-        max_turns: usize,
-    ) -> (ReactLoop, Arc<EchoProbe>) {
+    fn build_with_probe(llm: Arc<LLMClient>, max_turns: usize) -> (ReactLoop, Arc<EchoProbe>) {
         let executed = Arc::new(EchoProbe::default());
         let mut tools = ToolHashMap::new();
         tools.insert(
@@ -962,8 +904,8 @@ mod tests {
             FINAL_ANSWER_TOOL.to_owned(),
             Arc::new(FinalAnswer) as Arc<dyn Tool>,
         );
-        let agent = ReactLoop::new(completer, tools, "你是测试助手。", max_turns)
-            .expect("构造 ReactLoop 失败");
+        let agent =
+            ReactLoop::new(llm, tools, "你是测试助手。", max_turns).expect("构造 ReactLoop 失败");
         (agent, executed)
     }
 
@@ -980,11 +922,11 @@ mod tests {
 
     /// 与 [`build_with_probe`] 相同，但注入审批策略与（可选的）确认方。
     fn build_with_gate(
-        completer: Arc<dyn Completer>,
+        llm: Arc<LLMClient>,
         policy: ApprovalPolicy,
         confirmer: Option<Arc<dyn Confirmer>>,
     ) -> (ReactLoop, Arc<EchoProbe>) {
-        let (agent, executed) = build_with_probe(completer, DEFAULT_MAX_TURNS);
+        let (agent, executed) = build_with_probe(llm, DEFAULT_MAX_TURNS);
         let mut agent = agent.with_approval_policy(policy);
         if let Some(confirmer) = confirmer {
             agent = agent.with_confirmer(confirmer);
@@ -1031,7 +973,7 @@ mod tests {
     async fn final_answer_terminates_with_its_argument() {
         // final_answer 不被执行：参数即答案（`extract_answer` 与 `execute` 同源，
         // 所以这里断言的值与旧的 execute 返回值一致）。
-        let mut agent = build(ScriptedCompleter::new(vec![calls_final_answer("42")]));
+        let mut agent = build(scripted(vec![calls_final_answer("42")]));
 
         let outcome = agent
             .run("问题", &mut |_| {}, &mut |_, _| {})
@@ -1051,8 +993,8 @@ mod tests {
     #[tokio::test]
     async fn text_only_reply_degrades_to_answer() {
         // required 下服务端必须给 tool_call；纯文本说明端点无视了 tool_choice。
-        let completer = ScriptedCompleter::new(vec![text_reply("答案是 42")]);
-        let mut agent = build(completer.clone());
+        let llm = scripted(vec![text_reply("答案是 42")]);
+        let mut agent = build(llm.clone());
 
         let outcome = agent
             .run("问题", &mut |_| {}, &mut |_, _| {})
@@ -1063,7 +1005,7 @@ mod tests {
         assert_eq!(outcome.turns, 1);
         assert_eq!(outcome.termination, Termination::ModelFinished);
         assert_eq!(
-            completer.policies(),
+            policies(&llm),
             vec![ToolPolicy::Required],
             "循环内一律 required"
         );
@@ -1071,7 +1013,7 @@ mod tests {
 
     #[tokio::test]
     async fn executes_tool_then_answers() {
-        let mut agent = build(ScriptedCompleter::new(vec![
+        let mut agent = build(scripted(vec![
             calls_echo(r#"{"q":"hi"}"#),
             calls_final_answer("工具结果如上"),
         ]));
@@ -1093,7 +1035,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_failure_becomes_observation() {
-        let mut agent = build(ScriptedCompleter::new(vec![
+        let mut agent = build(scripted(vec![
             calls_echo(r#"{"q":"boom"}"#),
             calls_final_answer("工具失败了"),
         ]));
@@ -1109,7 +1051,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_tool_becomes_observation() {
-        let mut agent = build(ScriptedCompleter::new(vec![
+        let mut agent = build(scripted(vec![
             calls_unknown(),
             calls_final_answer("没有这个工具"),
         ]));
@@ -1125,7 +1067,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_final_answer_becomes_observation_and_retries() {
-        let mut agent = build(ScriptedCompleter::new(vec![
+        let mut agent = build(scripted(vec![
             call(FINAL_ANSWER_TOOL, "not json"),
             calls_final_answer("补上的答案"),
         ]));
@@ -1160,7 +1102,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_answer_alongside_other_calls_still_pairs_every_tool_message() {
-        let completer = ScriptedCompleter::new(vec![multi_call(vec![
+        let llm = scripted(vec![multi_call(vec![
             ("call_1", "echo", r#"{"q":"hi"}"#),
             (
                 "call_2",
@@ -1168,7 +1110,7 @@ mod tests {
                 r#"{"answer":"并存时以 final_answer 为准"}"#,
             ),
         ])]);
-        let (mut agent, executed) = build_with_probe(completer, DEFAULT_MAX_TURNS);
+        let (mut agent, executed) = build_with_probe(llm, DEFAULT_MAX_TURNS);
 
         let observed = Mutex::new(Vec::new());
         let outcome = agent
@@ -1214,14 +1156,14 @@ mod tests {
     #[tokio::test]
     async fn invalid_final_answer_among_siblings_does_not_terminate() {
         // 参数非法 → 本轮不算交付：兄弟调用照常执行并配对，让模型下一轮重试。
-        let completer = ScriptedCompleter::new(vec![
+        let llm = scripted(vec![
             multi_call(vec![
                 ("call_1", "echo", r#"{"q":"hi"}"#),
                 ("call_2", FINAL_ANSWER_TOOL, "not json"),
             ]),
             calls_final_answer("补上的答案"),
         ]);
-        let (mut agent, executed) = build_with_probe(completer, DEFAULT_MAX_TURNS);
+        let (mut agent, executed) = build_with_probe(llm, DEFAULT_MAX_TURNS);
 
         let outcome = agent
             .run("问题", &mut |_| {}, &mut |_, _| {})
@@ -1241,12 +1183,12 @@ mod tests {
 
     #[tokio::test]
     async fn max_turns_still_produces_an_answer() {
-        let completer = ScriptedCompleter::new(vec![
+        let llm = scripted(vec![
             calls_echo(r#"{"q":"1"}"#),
             calls_echo(r#"{"q":"2"}"#),
             calls_final_answer("被迫收尾的答案"),
         ]);
-        let mut agent = build_with_max_turns(completer.clone(), 2);
+        let mut agent = build_with_max_turns(llm.clone(), 2);
 
         let observed = Mutex::new(Vec::new());
         let outcome = agent
@@ -1267,7 +1209,7 @@ mod tests {
             "两轮 echo + 收尾轮的 final_answer"
         );
         assert_eq!(
-            completer.policies(),
+            policies(&llm),
             vec![
                 ToolPolicy::Required,
                 ToolPolicy::Required,
@@ -1291,11 +1233,11 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_turn_only_exposes_final_answer() {
-        let completer = ScriptedCompleter::new(vec![
+        let llm = scripted(vec![
             calls_echo(r#"{"q":"1"}"#),
             calls_final_answer("裁剪后的答案"),
         ]);
-        let mut agent = build_with_max_turns(completer.clone(), 1);
+        let mut agent = build_with_max_turns(llm.clone(), 1);
 
         let outcome = agent
             .run("问题", &mut |_| {}, &mut |_, _| {})
@@ -1304,7 +1246,7 @@ mod tests {
 
         assert_eq!(outcome.answer, "裁剪后的答案");
         assert_eq!(
-            completer.tool_names(),
+            tool_names(&llm),
             vec![
                 vec!["echo".to_owned(), FINAL_ANSWER_TOOL.to_owned()],
                 vec![FINAL_ANSWER_TOOL.to_owned()],
@@ -1315,11 +1257,11 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_falls_back_to_content_when_force_is_ignored() {
-        let completer = ScriptedCompleter::new(vec![
+        let llm = scripted(vec![
             calls_echo(r#"{"q":"1"}"#),
             text_reply("收尾轮只能说这些"),
         ]);
-        let mut agent = build_with_max_turns(completer, 1);
+        let mut agent = build_with_max_turns(llm, 1);
 
         let outcome = agent
             .run("问题", &mut |_| {}, &mut |_, _| {})
@@ -1332,8 +1274,8 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_with_empty_reply_still_delivers_a_message() {
-        let completer = ScriptedCompleter::new(vec![calls_echo(r#"{"q":"1"}"#), Reply::default()]);
-        let mut agent = build_with_max_turns(completer, 1);
+        let llm = scripted(vec![calls_echo(r#"{"q":"1"}"#), Reply::default()]);
+        let mut agent = build_with_max_turns(llm, 1);
 
         let outcome = agent
             .run("问题", &mut |_| {}, &mut |_, _| {})
@@ -1346,11 +1288,11 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_with_invalid_answer_degrades_instead_of_failing() {
-        let completer = ScriptedCompleter::new(vec![
+        let llm = scripted(vec![
             calls_echo(r#"{"q":"1"}"#),
             call(FINAL_ANSWER_TOOL, "not json"),
         ]);
-        let mut agent = build_with_max_turns(completer, 1);
+        let mut agent = build_with_max_turns(llm, 1);
 
         let outcome = agent
             .run("问题", &mut |_| {}, &mut |_, _| {})
@@ -1368,7 +1310,7 @@ mod tests {
 
     #[tokio::test]
     async fn final_turn_is_an_answer_not_a_thought() {
-        let mut agent = build(ScriptedCompleter::new(vec![
+        let mut agent = build(scripted(vec![
             calls_echo(r#"{"q":"hi"}"#),
             calls_final_answer("最终答案"),
         ]));
@@ -1393,7 +1335,7 @@ mod tests {
 
     #[tokio::test]
     async fn intermediate_turn_with_content_is_a_thought() {
-        let mut agent = build(ScriptedCompleter::new(vec![
+        let mut agent = build(scripted(vec![
             thinking_call("我先查一下", "echo", r#"{"q":"hi"}"#),
             calls_final_answer("答案"),
         ]));
@@ -1422,7 +1364,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_reply_ends_the_loop_with_an_empty_message() {
-        let mut agent = build(ScriptedCompleter::new(vec![Reply::default()]));
+        let mut agent = build(scripted(vec![Reply::default()]));
 
         let outcome = agent
             .run("问题", &mut |_| {}, &mut |_, _| {})
@@ -1442,7 +1384,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_flattens_failures_into_observations() {
-        let agent = build(ScriptedCompleter::new(Vec::new()));
+        let agent = build(scripted(Vec::new()));
 
         assert_eq!(
             agent.execute("echo", r#"{"q":"hi"}"#).await,
@@ -1463,13 +1405,12 @@ mod tests {
 
     #[tokio::test]
     async fn denied_call_becomes_observation_and_loop_continues() {
-        let completer = ScriptedCompleter::new(vec![
+        let llm = scripted(vec![
             calls_echo(r#"{"q":"hi"}"#),
             calls_final_answer("被拒之后改口"),
         ]);
         let confirmer = ScriptedConfirmer::new(vec![Decision::Deny]);
-        let (mut agent, executed) =
-            build_with_gate(completer, ask_for("echo"), Some(confirmer.clone()));
+        let (mut agent, executed) = build_with_gate(llm, ask_for("echo"), Some(confirmer.clone()));
 
         let observed = Mutex::new(Vec::new());
         let outcome = agent
@@ -1519,12 +1460,12 @@ mod tests {
 
     #[tokio::test]
     async fn approved_call_executes_normally() {
-        let completer = ScriptedCompleter::new(vec![
+        let llm = scripted(vec![
             calls_echo(r#"{"q":"hi"}"#),
             calls_final_answer("答案"),
         ]);
         let (mut agent, executed) =
-            build_with_gate(completer, ask_for("echo"), Some(Arc::new(AutoApprove)));
+            build_with_gate(llm, ask_for("echo"), Some(Arc::new(AutoApprove)));
 
         let outcome = agent
             .run("问题", &mut |_| {}, &mut |_, _| {})
@@ -1537,11 +1478,11 @@ mod tests {
 
     #[tokio::test]
     async fn ask_without_confirmer_suspends() {
-        let completer = ScriptedCompleter::new(vec![
+        let llm = scripted(vec![
             calls_echo(r#"{"q":"hi"}"#),
             calls_final_answer("退而求其次"),
         ]);
-        let (mut agent, executed) = build_with_gate(completer, ask_for("echo"), None);
+        let (mut agent, executed) = build_with_gate(llm, ask_for("echo"), None);
 
         let outcome = agent
             .run("问题", &mut |_| {}, &mut |_, _| {})
@@ -1566,14 +1507,14 @@ mod tests {
     /// 恢复：已完成的调用不重跑，待决调用恰好执行一次，随后照常收尾。
     #[tokio::test]
     async fn resume_continues_batch_without_rerunning_finished_calls() {
-        let completer = ScriptedCompleter::new(vec![
+        let llm = scripted(vec![
             multi_call(vec![
                 ("call_nope", "nope", "{}"),
                 ("call_echo", "echo", r#"{"q":"hi"}"#),
             ]),
             calls_final_answer("恢复之后的答案"),
         ]);
-        let (mut agent, executed) = build_with_gate(completer, ask_for("echo"), None);
+        let (mut agent, executed) = build_with_gate(llm, ask_for("echo"), None);
 
         let first = agent
             .run("问题", &mut |_| {}, &mut |_, _| {})
@@ -1633,8 +1574,8 @@ mod tests {
     /// 非挂起态调 `resume` 应报错。
     #[tokio::test]
     async fn resume_without_pending_batch_fails() {
-        let completer = ScriptedCompleter::new(vec![calls_final_answer("答案")]);
-        let (mut agent, _) = build_with_gate(completer, ask_for("echo"), None);
+        let llm = scripted(vec![calls_final_answer("答案")]);
+        let (mut agent, _) = build_with_gate(llm, ask_for("echo"), None);
 
         let result = agent
             .resume(Decision::Approve, 1, &mut |_| {}, &mut |_, _| {})
@@ -1645,17 +1586,14 @@ mod tests {
 
     #[tokio::test]
     async fn allow_policy_never_consults_confirmer() {
-        let completer = ScriptedCompleter::new(vec![
+        let llm = scripted(vec![
             calls_echo(r#"{"q":"hi"}"#),
             calls_final_answer("答案"),
         ]);
         // 策略全放行；confirmer 预置了拒绝决策——若被咨询，执行次数会变成 0。
         let confirmer = ScriptedConfirmer::new(vec![Decision::Deny]);
-        let (mut agent, executed) = build_with_gate(
-            completer,
-            ApprovalPolicy::default(),
-            Some(confirmer.clone()),
-        );
+        let (mut agent, executed) =
+            build_with_gate(llm, ApprovalPolicy::default(), Some(confirmer.clone()));
 
         let outcome = agent
             .run("问题", &mut |_| {}, &mut |_, _| {})
@@ -1671,12 +1609,11 @@ mod tests {
     async fn before_send_injection_reaches_transport_but_not_history() {
         const INJECTED: &str = "【注入】动态上下文（不应落历史）";
 
-        let scripted = ScriptedCompleter::new(vec![calls_final_answer("完成")]);
-        let completer: Arc<dyn Completer> = Arc::new(CallbackCompleter::new(
-            scripted.clone(),
-            vec![Arc::new(InjectMessage(INJECTED))],
-        ));
-        let mut agent = build(completer);
+        let llm = Arc::new(
+            LLMClient::scripted(vec![calls_final_answer("完成")])
+                .with_callbacks(vec![Arc::new(InjectMessage(INJECTED))]),
+        );
+        let mut agent = build(llm.clone());
 
         let outcome = agent
             .run("原始任务", &mut |_| {}, &mut |_, _| {})
@@ -1684,7 +1621,7 @@ mod tests {
             .expect("run 失败");
         assert_eq!(outcome.answer, "完成");
 
-        let seen = scripted.messages();
+        let seen = transport_messages(&llm);
         assert_eq!(seen.len(), 1, "只有一轮请求");
         assert!(
             seen[0].iter().any(|m| message_text(m).contains(INJECTED)),

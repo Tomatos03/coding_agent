@@ -20,7 +20,7 @@ paths:
 
 ## 错误处理
 
-统一用 `anyhow`：函数签名写 `anyhow::Result<T>`，用 `?` 传播。构造临时错误用 `anyhow::anyhow!`，条件缺失走 `.ok_or_else(|| anyhow::anyhow!("..."))` 而非 `unwrap()`——现有代码在解析 LLM 响应时一律如此（`src/agent/llm/models.rs` 的 `Completer`、`src/agent/react/runner.rs`）。
+统一用 `anyhow`：函数签名写 `anyhow::Result<T>`，用 `?` 传播。构造临时错误用 `anyhow::anyhow!`，条件缺失走 `.ok_or_else(|| anyhow::anyhow!("..."))` 而非 `unwrap()`——现有代码在解析 LLM 响应时一律如此（`src/agent/llm/models.rs` 的 `LLMClient`、`src/agent/react/runner.rs`）。
 
 **但有一处刻意例外**：`ReactLoop::execute` 的返回类型是 `String` 不是 `Result<String>`，因为工具失败必须变成一条 Observation 而不是中止循环。详见 `@rules/architecture.md` 第 5 节。
 
@@ -37,7 +37,7 @@ pub fn Ok<T>(value: T) -> Result<T>   // 等价于 Ok::<_, anyhow::Error>(value)
 ## 初始化与日志
 
 - 入口函数第一件事是 `bootstrap::init()`，它已包含 `dotenv` 与 `tracing`。
-- 日志用 `tracing` 宏；打印结构化响应时沿用量级较高的 `tracing::info!("LLM Response: {:#?}", response)` 形式，便于对拍。`print!` 仅用于流式输出的逐 token 呈现（`Completer::stream` 通过 `on_token` 回调把 token 交给调用方打印）。
+- 日志用 `tracing` 宏；打印结构化响应时沿用量级较高的 `tracing::info!("LLM Response: {:#?}", response)` 形式，便于对拍。`print!` 仅用于流式输出的逐 token 呈现（`LLMClient::stream` 通过 `on_token` 回调把 token 交给调用方打印）。
 
 ## 常量与命名
 
@@ -61,8 +61,8 @@ pub expression: String,
 
 ## 流式消费
 
-用 `futures::StreamExt`，再 `while let Some(item) = stream.next().await`（`src/agent/llm/models.rs` 的 `Completer::stream` 就是）。
+用 `futures::StreamExt`，再 `while let Some(item) = stream.next().await`（`src/agent/llm/models.rs` 的 `LLMClient::stream` 就是）。
 
 `async-openai` 的流式 chunk 里，token 在 `chunk.choices.first()?.delta.content`——用 let-chains 一层层剥：`if let Some(choice) = chunk.choices.first() && let Some(delta) = &choice.delta.content`。
 
-`Completer::stream` 用 **`on_token` 回调**把 token 交给调用方打印，函数最后返回 `Reply`——不是返回一个 `Stream`。原因是「边吐 token 边用」和「交出一个 `Stream` 让调用方自己驱动」是两种消费姿势，回调版在「打印到终端」这个主场景下更好用。要真正的 `Stream`，用 `futures::stream` 或 `async_stream::stream!` 自己包一层——`Cargo.toml` 里 `async-stream` 与 `uuid` 已就位但目前没有用例。
+`LLMClient::stream` 用 **`on_token` 回调**把 token 交给调用方打印，函数最后返回 `Reply`——不是返回一个 `Stream`。原因是「边吐 token 边用」和「交出一个 `Stream` 让调用方自己驱动」是两种消费姿势，回调版在「打印到终端」这个主场景下更好用。要真正的 `Stream`，用 `futures::stream` 或 `async_stream::stream!` 自己包一层——`Cargo.toml` 里 `async-stream` 与 `uuid` 已就位但目前没有用例。

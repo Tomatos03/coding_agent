@@ -11,7 +11,7 @@ let client = async_openai::Client::with_config(provider::client_config()?);     
 let client = async_openai::Client::with_config(provider::embedding_client_config()?); // embedding
 ```
 
-`client_config()` 现被两处共用：`src/agent/llm/models.rs` 的 `LLMClient::new`、`src/gaia/solver.rs` 的 `solve_gaia_question`。
+`client_config()` 现被两处共用：`src/agent/llm/models.rs` 的 `LLMClient`（构造真实后端时）、`src/gaia/solver.rs` 的 `solve_gaia_question`。
 
 它按 `CURRENT_USE_PROVIDER`（缺失时回退到 `constant::provider::DEFAULT_PROVIDER`）在 `constant::provider::PROVIDER_BASE_URL_VARS` 中查出该 provider 对应的 `*_API_BASE_URL` 与 `*_API_KEY` 两个环境变量名，任一缺失都报错并指明是哪个 provider 的哪个变量。
 
@@ -46,7 +46,7 @@ Prompt must contain the word 'json' in some form to use 'response_format' of typ
 
 ## 3. 并发闸门由调用方负责，不在传输层内部
 
-`src/agent/llm/semaphore.rs` 的 `get_semaphore()` 返回进程级 `&'static Semaphore`（3 permits），但 `Completer` 的两个方法（`complete` / `stream`）**内部都不会去获取它**。限流是否生效完全取决于调用方。
+`src/agent/llm/semaphore.rs` 的 `get_semaphore()` 返回进程级 `&'static Semaphore`（3 permits），但 `LLMClient` 的两个方法（`complete` / `stream`）**内部都不会去获取它**。限流是否生效完全取决于调用方。
 
 正确样板有两处：`src/bin/gaia.rs` 的 `gaia_level1_experiment()`、`examples/semaphore_chat.rs`——在 `JoinSet` 的每个 task 内部 `get_semaphore().acquire().await?`，用完 `drop(permit)`。
 
@@ -58,13 +58,13 @@ Prompt must contain the word 'json' in some form to use 'response_format' of typ
 
 统一用 `backon::{ExponentialBuilder, Retryable}` + `with_max_times(3)`，闭包返回的是**完整的** future。
 
-**目前只有一处实现了重试**：`src/gaia/solver.rs` 的 `solve_gaia_question_with_retry`。`Completer` 的两个方法都没有重试包装，需要时自己加。
+**目前只有一处实现了重试**：`src/gaia/solver.rs` 的 `solve_gaia_question_with_retry`。`LLMClient` 的两个方法都没有重试包装，需要时自己加。
 
-给流式加重试前必读：失败重试会重跑整个 stream，而上一轮已经 `print!` 出去的内容不会回滚，用户会看到重复输出。目前 `Completer::stream` **不写任何历史**（传输层已完全无状态），所以不存在「同一条回复进历史两次」的问题——但**给流式加副作用时（落库、追加消息）要重新考虑这件事**。
+给流式加重试前必读：失败重试会重跑整个 stream，而上一轮已经 `print!` 出去的内容不会回滚，用户会看到重复输出。目前 `LLMClient::stream` **不写任何历史**（传输层已完全无状态），所以不存在「同一条回复进历史两次」的问题——但**给流式加副作用时（落库、追加消息）要重新考虑这件事**。
 
 ## 5. ReAct 循环的四条不变量
 
-`src/agent/react/runner.rs` 的 `ReactLoop::run` 是全仓库唯一实现「请求 → 工具调用 → 回填 → 再请求」的地方（`LLMClient` 曾经有过一份自己的闭环，已随 `chat()` 一起删除）。四条不变量都是**违反时不报错、只在运行期静默出错**的：
+`src/agent/react/runner.rs` 的 `ReactLoop::run` 是全仓库唯一实现「请求 → 工具调用 → 回填 → 再请求」的地方（真实后端曾经有过一份自己的闭环，已随 `chat()` 一起删除）。四条不变量都是**违反时不报错、只在运行期静默出错**的：
 
 **① `execute` 返回 `String`，不返回 `Result<String>`。**
 
@@ -88,7 +88,7 @@ async fn execute(&self, name: &str, arguments: &str) -> String
 
 **审批闸门（危险工具确认）在 `run_pending_calls()` 里、`Step::Action` 之后、`execute()` 之前。** `ReactLoop` 持有 `approval_policy`（来自工作区根目录的 `.agents/settings.json`，经 `src/settings.rs` 的 `load_settings()` 加载；缺文件 = 全默认 = 全放行）与可选 `confirmer`（`src/agent/react/approval.rs` 的 `Confirmer` trait）。`action_for(name)` 判 `ask` 时经 `Confirmer` 拿决定：**拒绝被压成一条 Observation**（「用户拒绝执行工具…」）——它不是 `Err`、也不是 `execute` 之前的特例分支，而是与「工具失败 / 未知工具」完全相同的通道，不变量①②原样成立，消费方不用学新事件类型。两条静默陷阱：**(a)** 策略判 `ask` 但调用方未注入 `confirmer` 时**挂起**（`Termination::Suspended`），不再 fail-closed 直接拒绝——会话停在未执行完的工具批次上，等 session 层带决定 `resume`（`Confirmer` 主动返回 `Decision::Pending` 走同一条路；这是行为变更，详见第 11 节）；**(b)** 匹配只按**暴露名**做 glob（`*` 通配任意字符序列；`*__*` 恰命中一切 MCP 工具），参数级粒度（rm 拦、ls 放行）留给 `Confirmer` 自己看 `arguments`。豁免路径无需特判：`final_answer` 的交付路径与 `finalize()` 都不执行工具，结构上到不了闸门。`ReactLoop` 只收算好的 `ApprovalPolicy` / `Confirmer` 对象，自己不读文件——与「收 `ToolHashMap` 而不跑 `build_tools()`」同一条原则；配置启动时读一次，改完重启生效（与 `mcp.json` 一致）。
 
-**循环内每轮都是 `tool_choice=required`。** 服务端保证回复里至少有一个 `tool_call`，所以模型**只能**靠 `final_answer` 结束，`content` 永远只是 thought。两条降级路径兜底：(a) 回复里没有 `tool_calls` → 端点无视了强制，把 `content` 当答案收尾（`Termination::ModelFinished`）；(b) 端点以 400 明确拒绝 `tool_choice` → `LLMClient` 置粘性标记（`AtomicBool`）、改用 `Auto` 重发一次，此后所有请求都不再强制。`ToolPolicy`（`Auto` / `Required` / `Force(name)`）是请求级参数，随每轮传入 `Completer`，不能写进 messages。
+**循环内每轮都是 `tool_choice=required`。** 服务端保证回复里至少有一个 `tool_call`，所以模型**只能**靠 `final_answer` 结束，`content` 永远只是 thought。两条降级路径兜底：(a) 回复里没有 `tool_calls` → 端点无视了强制，把 `content` 当答案收尾（`Termination::ModelFinished`）；(b) 端点以 400 明确拒绝 `tool_choice` → 真实后端置粘性标记（`AtomicBool`）、改用 `Auto` 重发一次，此后所有请求都不再强制。`ToolPolicy`（`Auto` / `Required` / `Force(name)`）是请求级参数，随每轮传入 `LLMClient`，不能写进 messages。
 
 其余细节：`ReactLoop::new` 目前直接按 `ToolHashMap` 的迭代顺序收集工具定义（`HashMap` 顺序不保证，跨进程/跨运行可能不同，请求内容因此**不是严格可复现的**——要复现需在 `new` 里按名字排序后再 `map(definition)`）；`Thought`（`content`）和 `Action`（`tool_calls`）**一起**写进历史，丢掉 `content` 就丢了 ReAct 里的思考环节；模型返回空回复（content 与 tool_calls 都为空）时直接以 `Termination::EmptyReply` 收束，不再 nudge 并继续。`final_answer` 的注册责任在**工具表构建方**：`build_tools*` 经 `local_tools()` 注册它；`ReactLoop::new` **不做兜底注入**，手工拼表的调用方必须自行插入，否则收尾轮的具名 `tool_choice` 会指向一个未声明的函数、被服务端拒绝。
 
@@ -184,9 +184,9 @@ pub struct ChatCompletionStreamResponseDelta {
 
 ## 10. 消息发送前后的回调（`Callback`）
 
-`src/agent/llm/callback.rs` 在传输层唯一的接缝 `Completer` 外套一个透明装饰器 `CallbackCompleter`，在每轮请求前后派发回调链。`ReactLoop`、`History`、`src/tools/` 的**生产代码零改动**——不注册回调、不包装它时，全链路与没有这层时逐字节一致。
+`src/agent/llm/callback.rs` 的回调链直接挂在传输层的唯一类型 `LLMClient` 上（`LLMClient::with_callbacks`，派发在模块内的 `prepare` / `conclude`）：每轮请求前后派发一次，`ReactLoop`、`History`、`src/tools/` 的**生产代码零改动**——不注册回调时，全链路与没有这层时逐字节一致。
 
-**接缝形状。** 根特征 `Callback` 只有一个方法 `call(event)`，挂点做成数据（`CallbackEvent` 枚举）：`BeforeSend { messages: &mut Vec<_> }` 与 `AfterSend { messages: &[..], reply: &mut Reply }`。能力约束做进类型——`BeforeSend` 只给可变消息，`AfterSend` 消息只读、只有回复可改。枚举标 `#[non_exhaustive]`：将来新增挂点（工具前后、Step 事件等）只加变体，trait / 装饰器 / 既有实现都不变；实现用 `let CallbackEvent::X { .. } = event else { return Ok(()) };` 放行模板即可对新增变体免疫（外部 crate 的 `match` 必须带通配臂）。
+**接缝形状。** 根特征 `Callback` 只有一个方法 `call(event)`，挂点做成数据（`CallbackEvent` 枚举）：`BeforeSend { messages: &mut Vec<_> }` 与 `AfterSend { messages: &[..], reply: &mut Reply }`。能力约束做进类型——`BeforeSend` 只给可变消息，`AfterSend` 消息只读、只有回复可改。枚举标 `#[non_exhaustive]`：将来新增挂点（工具前后、Step 事件等）只加变体，trait / 派发逻辑 / 既有实现都不变；实现用 `let CallbackEvent::X { .. } = event else { return Ok(()) };` 放行模板即可对新增变体免疫（外部 crate 的 `match` 必须带通配臂）。
 
 **洋葱顺序。** `BeforeSend` 正序、`AfterSend` 逆序（注册 `[Logger, Redactor]` 时，`Logger.AfterSend` 看到的是 `Redactor` 处理过的最终回复）。
 
@@ -198,7 +198,7 @@ pub struct ChatCompletionStreamResponseDelta {
 
 **前缀缓存约束（`BeforeSend` 的核心）。** 主流 provider 对 prompt 的**最长公共 token 前缀**做 KV 缓存，从第一个 token 起精确匹配：注入要**拼在尾部**（插开头 / 中间会让插入点之后全部 miss）；裁剪 / 掩蔽要**攒批 + 滞回**（超上限才裁、一次裁到下限），两次事件之间保持 append-only，否则每轮前缀都在变、缓存全失效。用响应 usage 的 `prompt_tokens` / `prompt_cache_hit_tokens` 观测命中率。
 
-**接缝分工。** `on_token`（逐 token 观察）、`on_step`（循环事件观察）、`Confirmer`（工具执行前批准 / 拒绝）都是「观察者」或「闸门」；`Callback` 是第一个**可变异**的接缝，所以是 async trait + `Result`。v1 不覆盖 GAIA 直答模式（它不走 `Completer`），也看不到轮次 / 阶段 / tools / `tool_choice`（留 v2）。参考实现见 `examples/callback_react.rs`（观察掩蔽 + 滑动窗口裁剪 + 动态注入 + 回复脱敏，离线可跑）。回调做持久化裁剪 / 摘要是**另一个机制**（管「存下来多少」），与本接缝（管「发出去多少」）互补。
+**接缝分工。** `on_token`（逐 token 观察）、`on_step`（循环事件观察）、`Confirmer`（工具执行前批准 / 拒绝）都是「观察者」或「闸门」；`Callback` 是第一个**可变异**的接缝，所以是 async trait + `Result`。v1 不覆盖 GAIA 直答模式（它不走 `LLMClient`），也看不到轮次 / 阶段 / tools / `tool_choice`（留 v2）。参考实现见 `examples/callback_react.rs`（观察掩蔽 + 滑动窗口裁剪 + 动态注入 + 回复脱敏，离线可跑）。回调做持久化裁剪 / 摘要是**另一个机制**（管「存下来多少」），与本接缝（管「发出去多少」）互补。
 
 ## 11. Session 机制（多轮会话 / 多会话管理 / 审批挂起）
 

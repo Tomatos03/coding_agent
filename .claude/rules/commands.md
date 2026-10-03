@@ -68,7 +68,7 @@ MCP 相关共 32 个：
 - `src/tools/mcp/connection.rs` 5 个（1 个 ignored）：`Send + Sync`、空配置、失败隔离、真实 server 工具发现
 - `src/tools/mod.rs` 4 个（1 个 ignored）：重名去重、空配置含 `web_search` + `final_answer` 两个本地工具、连接在注册后仍存活、**每个工具的 definition 都必须是顶层 `type: "object"` 的 schema**（防 `edit_file` 那类 400 回潮）。
 
-GAIA 相关 11 个（全部离线）：`src/gaia/solver.rs` 6 个（严格 JSON / 代码块与正文包裹 / 字符串内花括号 / 纯文本兜底 / 空内容报错 / 无平衡对象），`src/gaia/report.rs` 2 个（按模型×模式汇总、通过率边界），`src/gaia/evaluator.rs` 2 个（脚本化 `Completer` 跑通带工具的 ReAct 路径并统计工具调用次数；**`final_answer` 不计入工具调用**），`src/gaia/models.rs` 1 个（`schemars` 的 `deny_unknown_fields` 只作用于 JSON Schema，serde 侧仍忽略未知字段）。
+GAIA 相关 11 个（全部离线）：`src/gaia/solver.rs` 6 个（严格 JSON / 代码块与正文包裹 / 字符串内花括号 / 纯文本兜底 / 空内容报错 / 无平衡对象），`src/gaia/report.rs` 2 个（按模型×模式汇总、通过率边界），`src/gaia/evaluator.rs` 2 个（脚本化 `LLMClient` 跑通带工具的 ReAct 路径并统计工具调用次数；**`final_answer` 不计入工具调用**），`src/gaia/models.rs` 1 个（`schemars` 的 `deny_unknown_fields` 只作用于 JSON Schema，serde 侧仍忽略未知字段）。
 
 RAG 相关 16 个：`src/agent/rag/store.rs` 12 个（余弦五态：相同/平行/正交/相反/零向量；空向量与维度守卫；降序排序、top_k 截断/为 0、空库、查询维度不符），全部离线；`src/agent/rag/embed.rs` 4 个（1 个 ignored：请求体序列化、首条向量提取、空 data 报错；真实端点联测）。
 
@@ -78,9 +78,9 @@ RAG 相关 16 个：`src/agent/rag/store.rs` 12 个（余弦五态：相同/平�
 cargo test --lib -- --ignored
 ```
 
-能离线测的原因是把传输层抽象成了 `Completer` trait：测试用 `ScriptedCompleter`（预置响应队列）+ `EchoTool`（参数含 `boom` 就报错）替掉真实网络。MCP 侧同理——用 `tests/fixtures/` 下的假 server 替掉真实 MCP server。
+能离线测的原因是把传输层收成了唯一的具体类型 `LLMClient`：测试用它的脚本化后端（`LLMClient::scripted(...)` 预置响应队列，并在 `test_support` 里记录每次请求）+ `EchoTool`（参数含 `boom` 就报错）替掉真实网络。MCP 侧同理——用 `tests/fixtures/` 下的假 server 替掉真实 MCP server。
 
-**给新组件补测试时沿用这个模式**：先做一个 trait 接缝，再写假的实现。`Reply` 有 `Default` 且字段是 `String` / `Vec`，构造测试响应不需要任何辅助函数。
+**给新组件补测试时沿用这个模式**：先把变化点收成一个接缝（多数是 trait；`LLMClient` 是例外——单类型 + 脚本化后端），再写假的实现。`Reply` 有 `Default` 且字段是 `String` / `Vec`，构造测试响应不需要任何辅助函数。
 
 `tests/` 目录只放测试支撑资源（目前是 `tests/fixtures/fake_mcp_server.py`），没有 Rust 集成测试目标。`cargo test` **不**编译 `examples/`；要连示例一起校验得用 `cargo test --all-targets`（README 的跑法就是它）。
 

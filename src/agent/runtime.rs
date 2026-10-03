@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::agent::llm::models::Completer;
+use crate::agent::llm::models::LLMClient;
 use crate::agent::react::approval::{Confirmer, Decision};
 use crate::agent::react::models::{Outcome, PendingApproval, Step, Termination};
 use crate::agent::session::manager::{
@@ -26,13 +26,13 @@ pub struct Agent {
 impl Agent {
     /// 组装期入口：模型、工具、system prompt、轮次上限都从这里进。
     pub fn builder(
-        completer: Arc<dyn Completer>,
+        llm: Arc<LLMClient>,
         tools: ToolHashMap,
         system_prompt: &str,
         max_turns: usize,
     ) -> AgentBuilder {
         AgentBuilder {
-            completer,
+            llm,
             tools,
             system_prompt: system_prompt.to_owned(),
             max_turns,
@@ -391,7 +391,7 @@ fn print_help(console: &mut dyn Console) {
 
 /// 组装中的配置。`in_memory()` 是终点。
 pub struct AgentBuilder {
-    completer: Arc<dyn Completer>,
+    llm: Arc<LLMClient>,
     tools: ToolHashMap,
     system_prompt: String,
     max_turns: usize,
@@ -420,7 +420,7 @@ impl AgentBuilder {
     /// 本轮唯一可用的后端；v2 在这里加 `.file_store(dir)`。
     pub fn in_memory(self) -> Agent {
         let config = SessionRuntimeConfig {
-            completer: self.completer,
+            llm: self.llm,
             tools: self.tools,
             system_prompt: self.system_prompt,
             max_turns: self.max_turns,
@@ -437,55 +437,22 @@ impl AgentBuilder {
 #[cfg(test)]
 mod tests {
     use async_openai::types::chat::{
-        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-        ChatCompletionRequestMessage, FunctionCall,
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, FunctionCall,
     };
     use async_trait::async_trait;
     use serde_json::{Value, json};
     use std::collections::VecDeque;
-    use std::sync::Mutex;
 
     use super::*;
-    use crate::agent::llm::models::{Reply, ToolPolicy};
+    use crate::agent::llm::models::Reply;
     use crate::agent::react::models::DEFAULT_MAX_TURNS;
     use crate::settings::{ApprovalAction, ApprovalPolicy, ApprovalRule};
     use crate::tools::local::final_answer::{FINAL_ANSWER_TOOL, FinalAnswer};
     use crate::tools::tool::Tool;
 
-    /// 永远直接交付答案的假传输层。
-    struct AlwaysFinal;
-
-    #[async_trait]
-    impl Completer for AlwaysFinal {
-        async fn complete(
-            &self,
-            _messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
-            _policy: ToolPolicy,
-        ) -> anyhow::Result<Reply> {
-            anyhow::bail!("本测试只走 stream 路径")
-        }
-
-        async fn stream(
-            &self,
-            _messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
-            _policy: ToolPolicy,
-            _on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
-        ) -> anyhow::Result<Reply> {
-            Ok(Reply {
-                content: String::new(),
-                tool_calls: vec![ChatCompletionMessageToolCalls::Function(
-                    ChatCompletionMessageToolCall {
-                        id: "call_final".to_owned(),
-                        function: FunctionCall {
-                            name: FINAL_ANSWER_TOOL.to_owned(),
-                            arguments: json!({ "answer": "完成" }).to_string(),
-                        },
-                    },
-                )],
-            })
-        }
+    /// 脚本化 `LLMClient` 的构造助手（真实类型只有 `LLMClient` 一个）。
+    fn scripted(replies: Vec<Reply>) -> Arc<LLMClient> {
+        Arc::new(LLMClient::scripted(replies))
     }
 
     fn agent() -> Agent {
@@ -495,7 +462,7 @@ mod tests {
             Arc::new(FinalAnswer) as Arc<dyn Tool>,
         );
         Agent::builder(
-            Arc::new(AlwaysFinal),
+            scripted(vec![final_reply("完成")]),
             tools,
             "你是测试助手。",
             DEFAULT_MAX_TURNS,
@@ -516,9 +483,14 @@ mod tests {
             FINAL_ANSWER_TOOL.to_owned(),
             Arc::new(FinalAnswer) as Arc<dyn Tool>,
         );
-        let agent = Agent::builder(Arc::new(AlwaysFinal), tools, "sys", DEFAULT_MAX_TURNS)
-            .default_user("u1")
-            .in_memory();
+        let agent = Agent::builder(
+            scripted(vec![final_reply("完成")]),
+            tools,
+            "sys",
+            DEFAULT_MAX_TURNS,
+        )
+        .default_user("u1")
+        .in_memory();
 
         let session = agent.new_session().await.expect("create 失败");
 
@@ -601,50 +573,6 @@ mod tests {
         }
     }
 
-    /// 按预置队列返回回复的假传输层。
-    struct QueueCompleter {
-        replies: Mutex<VecDeque<Reply>>,
-    }
-
-    impl QueueCompleter {
-        fn new(replies: Vec<Reply>) -> Arc<Self> {
-            Arc::new(Self {
-                replies: Mutex::new(replies.into()),
-            })
-        }
-    }
-
-    #[async_trait]
-    impl Completer for QueueCompleter {
-        async fn complete(
-            &self,
-            _messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
-            _policy: ToolPolicy,
-        ) -> anyhow::Result<Reply> {
-            anyhow::bail!("本测试只走 stream 路径")
-        }
-
-        async fn stream(
-            &self,
-            _messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
-            _policy: ToolPolicy,
-            on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
-        ) -> anyhow::Result<Reply> {
-            let reply = self
-                .replies
-                .lock()
-                .expect("锁被毒化")
-                .pop_front()
-                .expect("预置回复已用尽");
-            if !reply.content.is_empty() {
-                on_token(&reply.content);
-            }
-            Ok(reply)
-        }
-    }
-
     /// 只用于让策略有东西可问；挂起发生在执行之前，它不会被真的调用。
     struct ProbeTool;
 
@@ -706,7 +634,7 @@ mod tests {
         );
         tools.insert("probe".to_owned(), Arc::new(ProbeTool) as Arc<dyn Tool>);
         Agent::builder(
-            QueueCompleter::new(replies),
+            scripted(replies),
             tools,
             "你是测试助手。",
             DEFAULT_MAX_TURNS,

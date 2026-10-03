@@ -1,4 +1,6 @@
+use super::callback::{self, Callback};
 use super::provider;
+use super::test_support::{Scripted, ScriptedRequest};
 use crate::constant::provider::MAX_TOKENS_ENV;
 
 use crate::tools::{ToolHashMap, tool_definitions};
@@ -12,6 +14,7 @@ use async_openai::types::chat::{
     ToolChoiceOptions,
 };
 use futures::StreamExt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Default)]
@@ -105,34 +108,24 @@ fn rejected_tool_choice(err: &OpenAIError) -> bool {
     }
 }
 
-#[async_trait::async_trait]
-pub trait Completer: Send + Sync {
-    async fn complete(
-        &self,
-        messages: &[ChatCompletionRequestMessage],
-        tools: Option<&ToolHashMap>,
-        policy: ToolPolicy,
-    ) -> anyhow::Result<Reply>;
-
-    async fn stream(
-        &self,
-        messages: &[ChatCompletionRequestMessage],
-        tools: Option<&ToolHashMap>,
-        policy: ToolPolicy,
-        on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
-    ) -> anyhow::Result<Reply>;
+/// 传输层：编排层唯一依赖的「完成器」。
+///
+/// 只有一个具体类型，没有 trait：真实后端与测试 / 离线示例用的脚本化后端都收在
+/// `backend` 字段里，公开行为由 [`LLMClient::complete`] / [`LLMClient::stream`]
+/// 统一派发。请求前后的回调链也在这一层挂载（见 [`LLMClient::with_callbacks`]
+/// 与 [`callback`] 模块）：不注册回调时，全链路与没有这层逐字节一致。
+pub struct LLMClient {
+    backend: Backend,
+    callbacks: Vec<Arc<dyn Callback>>,
 }
 
-pub struct LLMClient {
-    model: String,
-    max_tokens: u32,
-    internal_client: async_openai::Client<OpenAIConfig>,
-    /// 端点明确拒绝过 `tool_choice` 之后置位：此后所有请求都不再强制，
-    /// 避免每一轮都白挨一次 400。粘性标记，进程内只付一次探测成本。
-    tool_choice_unsupported: AtomicBool,
+enum Backend {
+    Live(Live),
+    Scripted(Scripted),
 }
 
 impl LLMClient {
+    /// 从环境变量读模型与 provider 配置构造真实客户端；配置缺失时 panic。
     pub fn new() -> Self {
         let model = provider::model_id().expect("缺少 CURRENT_USE_MODEL_ID，请检查 .env");
         Self::from_model(&model).expect("缺少 provider 配置，请检查 .env")
@@ -141,6 +134,87 @@ impl LLMClient {
     /// 用显式模型 ID 构造：调用方已经读过 `model_id()` 时不必再读一次环境变量，
     /// 也避免 `new()` 在配置缺失时 panic。
     pub fn from_model(model: &str) -> anyhow::Result<Self> {
+        Ok(Self {
+            backend: Backend::Live(Live::new(model)?),
+            callbacks: Vec::new(),
+        })
+    }
+
+    /// 脚本化：按预置队列返回回复、不触碰网络。测试与离线示例使用。
+    pub fn scripted(replies: Vec<Reply>) -> Self {
+        Self {
+            backend: Backend::Scripted(Scripted::new(replies)),
+            callbacks: Vec::new(),
+        }
+    }
+
+    /// 注册请求前后的回调链，顺序 = 注册顺序：`BeforeSend` 正序、`AfterSend` 逆序。
+    pub fn with_callbacks(mut self, callbacks: Vec<Arc<dyn Callback>>) -> Self {
+        self.callbacks = callbacks;
+        self
+    }
+
+    /// 脚本化模式下每次请求的快照（消息 / 工具名 / 策略）；live 模式恒为空。
+    /// 仅测试与示例用来断言「实际发出去的是什么」。
+    pub fn scripted_requests(&self) -> Vec<ScriptedRequest> {
+        match &self.backend {
+            Backend::Scripted(scripted) => scripted.requests(),
+            Backend::Live(_) => Vec::new(),
+        }
+    }
+
+    /// 一次性完成：请求先过回调链，拿到回复后再逆序过回调链。
+    pub async fn complete(
+        &self,
+        messages: &[ChatCompletionRequestMessage],
+        tools: Option<&ToolHashMap>,
+        policy: ToolPolicy,
+    ) -> anyhow::Result<Reply> {
+        let messages = callback::prepare(&self.callbacks, messages).await?;
+        let mut reply = match &self.backend {
+            Backend::Live(live) => live.complete(&messages, tools, policy).await?,
+            Backend::Scripted(scripted) => scripted.next(&messages, tools, &policy, &mut |_| {})?,
+        };
+        callback::conclude(&self.callbacks, &messages, &mut reply).await?;
+        Ok(reply)
+    }
+
+    /// 流式完成：`on_token` 直通内层，token 级改写不在回调接缝范围内。
+    pub async fn stream(
+        &self,
+        messages: &[ChatCompletionRequestMessage],
+        tools: Option<&ToolHashMap>,
+        policy: ToolPolicy,
+        on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
+    ) -> anyhow::Result<Reply> {
+        let messages = callback::prepare(&self.callbacks, messages).await?;
+        let mut reply = match &self.backend {
+            Backend::Live(live) => live.stream(&messages, tools, policy, on_token).await?,
+            Backend::Scripted(scripted) => scripted.next(&messages, tools, &policy, on_token)?,
+        };
+        callback::conclude(&self.callbacks, &messages, &mut reply).await?;
+        Ok(reply)
+    }
+}
+
+impl Default for LLMClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 真实后端：持有 model 名与 `async_openai` 客户端。
+struct Live {
+    model: String,
+    max_tokens: u32,
+    internal_client: async_openai::Client<OpenAIConfig>,
+    /// 端点明确拒绝过 `tool_choice` 之后置位：此后所有请求都不再强制，
+    /// 避免每一轮都白挨一次 400。粘性标记，进程内只付一次探测成本。
+    tool_choice_unsupported: AtomicBool,
+}
+
+impl Live {
+    fn new(model: &str) -> anyhow::Result<Self> {
         let internal_client = async_openai::Client::with_config(provider::client_config()?);
 
         Ok(Self {
@@ -181,10 +255,7 @@ impl LLMClient {
         tracing::warn!("端点拒绝 tool_choice（{err}），后续请求降级为 auto");
         ToolPolicy::Auto
     }
-}
 
-#[async_trait::async_trait]
-impl Completer for LLMClient {
     async fn complete(
         &self,
         messages: &[ChatCompletionRequestMessage],
@@ -342,12 +413,6 @@ impl ToolCallFragment {
                 self.arguments.push_str(arguments);
             }
         }
-    }
-}
-
-impl Default for LLMClient {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

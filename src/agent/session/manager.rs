@@ -13,7 +13,7 @@ use serde_json::json;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::agent::llm::models::Completer;
+use crate::agent::llm::models::LLMClient;
 use crate::agent::react::approval::{ApprovalRequest, Confirmer, Decision};
 use crate::agent::react::history::History;
 use crate::agent::react::models::{Outcome, PendingApproval, Step, Termination};
@@ -26,7 +26,7 @@ use super::models::{Session, SessionSummary, state_keys};
 /// 建一个 session 的运行时所需的全部配置。manager 用它为每个新会话建 loop。
 #[derive(Clone)]
 pub struct SessionRuntimeConfig {
-    pub completer: Arc<dyn Completer>,
+    pub llm: Arc<LLMClient>,
     pub tools: ToolHashMap,
     pub system_prompt: String,
     pub max_turns: usize,
@@ -112,7 +112,7 @@ impl InMemorySessionManager {
     fn engine_for(&self, history: History) -> anyhow::Result<ReactLoop> {
         let mut engine = ReactLoop::from_history(
             history,
-            self.config.completer.clone(),
+            self.config.llm.clone(),
             self.config.tools.clone(),
             self.config.max_turns,
         )?
@@ -323,84 +323,35 @@ mod tests {
     use crate::tools::local::final_answer::{FINAL_ANSWER_TOOL, FinalAnswer};
     use crate::tools::tool::Tool;
 
-    /// 预置回复队列，并记录每次请求收到的消息。
-    struct ScriptedCompleter {
-        replies: Mutex<Vec<Reply>>,
-        seen: Mutex<Vec<Vec<ChatCompletionRequestMessage>>>,
-    }
-
-    impl ScriptedCompleter {
-        fn new(replies: Vec<Reply>) -> Arc<Self> {
-            Arc::new(Self {
-                replies: Mutex::new(replies),
-                seen: Mutex::new(Vec::new()),
-            })
-        }
-
-        async fn seen(&self) -> Vec<Vec<ChatCompletionRequestMessage>> {
-            self.seen.lock().await.clone()
-        }
-    }
-
+    use crate::agent::llm::callback::{Callback, CallbackEvent};
     use crate::agent::llm::models::Reply;
 
-    #[async_trait]
-    impl Completer for ScriptedCompleter {
-        async fn complete(
-            &self,
-            _messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
-            _policy: crate::agent::llm::models::ToolPolicy,
-        ) -> anyhow::Result<Reply> {
-            anyhow::bail!("本测试只走 stream 路径")
-        }
-
-        async fn stream(
-            &self,
-            messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
-            _policy: crate::agent::llm::models::ToolPolicy,
-            on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
-        ) -> anyhow::Result<Reply> {
-            self.seen.lock().await.push(messages.to_vec());
-            let mut replies = self.replies.lock().await;
-            if replies.is_empty() {
-                anyhow::bail!("预置回复已用尽");
-            }
-            let reply = replies.remove(0);
-            if !reply.content.is_empty() {
-                on_token(&reply.content);
-            }
-            Ok(reply)
-        }
+    /// 脚本化 `LLMClient`：按预置回复队列驱动会话，并记录每次请求。
+    fn scripted(replies: Vec<Reply>) -> Arc<LLMClient> {
+        Arc::new(LLMClient::scripted(replies))
     }
 
-    /// 命中标记就把自己挂住，直到被放行——用来证明「不同 session 互不阻塞」。
-    struct GatedCompleter {
+    /// 每次请求实际收到的消息（已过回调链）。
+    fn seen(llm: &LLMClient) -> Vec<Vec<ChatCompletionRequestMessage>> {
+        llm.scripted_requests()
+            .into_iter()
+            .map(|request| request.messages)
+            .collect()
+    }
+
+    /// `BeforeSend` 命中标记就把请求挂住，直到被放行——用来证明「不同 session 互不阻塞」。
+    struct Gate {
         marker: String,
-        reply: Reply,
         entered: Arc<Notify>,
         release: Arc<Notify>,
     }
 
     #[async_trait]
-    impl Completer for GatedCompleter {
-        async fn complete(
-            &self,
-            _messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
-            _policy: crate::agent::llm::models::ToolPolicy,
-        ) -> anyhow::Result<Reply> {
-            anyhow::bail!("本测试只走 stream 路径")
-        }
-
-        async fn stream(
-            &self,
-            messages: &[ChatCompletionRequestMessage],
-            _tools: Option<&ToolHashMap>,
-            _policy: crate::agent::llm::models::ToolPolicy,
-            _on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
-        ) -> anyhow::Result<Reply> {
+    impl Callback for Gate {
+        async fn call(&self, event: CallbackEvent<'_>) -> anyhow::Result<()> {
+            let CallbackEvent::BeforeSend { messages } = event else {
+                return Ok(());
+            };
             let hit = messages.iter().any(|message| {
                 serde_json::to_string(message)
                     .unwrap_or_default()
@@ -410,7 +361,7 @@ mod tests {
                 self.entered.notify_one();
                 self.release.notified().await;
             }
-            Ok(self.reply.clone())
+            Ok(())
         }
     }
 
@@ -479,7 +430,7 @@ mod tests {
         executed: Arc<AtomicUsize>,
     }
 
-    fn harness(completer: Arc<dyn Completer>, policy: ApprovalPolicy) -> Harness {
+    fn harness(llm: Arc<LLMClient>, policy: ApprovalPolicy) -> Harness {
         let executed = Arc::new(AtomicUsize::new(0));
         let mut tools = ToolHashMap::new();
         tools.insert(
@@ -495,7 +446,7 @@ mod tests {
         );
 
         let config = SessionRuntimeConfig {
-            completer,
+            llm,
             tools,
             system_prompt: "你是测试助手。".to_owned(),
             max_turns: DEFAULT_MAX_TURNS,
@@ -541,10 +492,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_produces_distinct_sessions_with_system_history() {
-        let h = harness(
-            ScriptedCompleter::new(Vec::new()),
-            ApprovalPolicy::default(),
-        );
+        let h = harness(scripted(Vec::new()), ApprovalPolicy::default());
 
         let first = h.manager.create(None).await.expect("create 失败");
         let second = h
@@ -563,10 +511,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_and_delete_report_absence() {
-        let h = harness(
-            ScriptedCompleter::new(Vec::new()),
-            ApprovalPolicy::default(),
-        );
+        let h = harness(scripted(Vec::new()), ApprovalPolicy::default());
         let created = h.manager.create(None).await.expect("create 失败");
 
         assert!(h.manager.get("missing").await.expect("get 失败").is_none());
@@ -603,7 +548,7 @@ mod tests {
     #[tokio::test]
     async fn list_filters_by_user_and_lists_newest_first() {
         let h = harness(
-            ScriptedCompleter::new(vec![final_answer("完成")]),
+            scripted(vec![final_answer("完成")]),
             ApprovalPolicy::default(),
         );
         let idle = h
@@ -641,9 +586,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_accumulates_multi_turn_history() {
-        let completer =
-            ScriptedCompleter::new(vec![final_answer("第一答"), final_answer("第二答")]);
-        let h = harness(completer.clone(), ApprovalPolicy::default());
+        let llm = scripted(vec![final_answer("第一答"), final_answer("第二答")]);
+        let h = harness(llm.clone(), ApprovalPolicy::default());
         let session = h.manager.create(None).await.expect("create 失败");
 
         send(&h.manager, &session.session_id, "第一问")
@@ -654,9 +598,9 @@ mod tests {
             .expect("send 失败");
 
         assert_eq!(outcome.answer, "第二答");
-        let seen = completer.seen().await;
-        assert_eq!(seen.len(), 2, "多轮 = 两次请求，共用同一个 loop");
-        let second_request = &seen[1];
+        let requests = seen(&llm);
+        assert_eq!(requests.len(), 2, "多轮 = 两次请求，共用同一个 loop");
+        let second_request = &requests[1];
         let text = serde_json::to_string(second_request).expect("序列化失败");
         assert!(text.contains("第一问"), "第二轮应看到第一轮的提问");
         assert!(text.contains("第一答"), "第二轮应看到第一轮的回答");
@@ -673,8 +617,8 @@ mod tests {
 
     #[tokio::test]
     async fn ask_without_confirmer_suspends_and_records_state() {
-        let completer = ScriptedCompleter::new(vec![call("call_probe", "probe", "{}")]);
-        let h = harness(completer, ask_for("probe"));
+        let llm = scripted(vec![call("call_probe", "probe", "{}")]);
+        let h = harness(llm, ask_for("probe"));
         let session = h.manager.create(None).await.expect("create 失败");
 
         let outcome = send(&h.manager, &session.session_id, "跑一下")
@@ -712,11 +656,11 @@ mod tests {
 
     #[tokio::test]
     async fn resume_approve_executes_pending_call_once_and_finishes() {
-        let completer = ScriptedCompleter::new(vec![
+        let llm = scripted(vec![
             call("call_probe", "probe", "{}"),
             final_answer("办好了"),
         ]);
-        let h = harness(completer, ask_for("probe"));
+        let h = harness(llm, ask_for("probe"));
         let session = h.manager.create(None).await.expect("create 失败");
         send(&h.manager, &session.session_id, "跑一下")
             .await
@@ -747,11 +691,11 @@ mod tests {
 
     #[tokio::test]
     async fn resume_deny_becomes_observation_and_loop_continues() {
-        let completer = ScriptedCompleter::new(vec![
+        let llm = scripted(vec![
             call("call_probe", "probe", "{}"),
             final_answer("换个办法"),
         ]);
-        let h = harness(completer, ask_for("probe"));
+        let h = harness(llm, ask_for("probe"));
         let session = h.manager.create(None).await.expect("create 失败");
         send(&h.manager, &session.session_id, "跑一下")
             .await
@@ -777,8 +721,8 @@ mod tests {
 
     #[tokio::test]
     async fn send_on_suspended_and_resume_on_running_both_fail() {
-        let completer = ScriptedCompleter::new(vec![call("call_probe", "probe", "{}")]);
-        let h = harness(completer, ask_for("probe"));
+        let llm = scripted(vec![call("call_probe", "probe", "{}")]);
+        let h = harness(llm, ask_for("probe"));
         let session = h.manager.create(None).await.expect("create 失败");
 
         assert!(
@@ -801,8 +745,8 @@ mod tests {
 
     #[tokio::test]
     async fn same_session_sends_are_serialized_without_losing_messages() {
-        let completer = ScriptedCompleter::new(vec![final_answer("一"), final_answer("二")]);
-        let h = harness(completer, ApprovalPolicy::default());
+        let llm = scripted(vec![final_answer("一"), final_answer("二")]);
+        let h = harness(llm, ApprovalPolicy::default());
         let session = h.manager.create(None).await.expect("create 失败");
 
         let (first, second) = tokio::join!(
@@ -838,13 +782,16 @@ mod tests {
     async fn different_sessions_do_not_block_each_other() {
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
-        let completer = Arc::new(GatedCompleter {
-            marker: "【阻塞标记】".to_owned(),
-            reply: final_answer("完成"),
-            entered: entered.clone(),
-            release: release.clone(),
-        });
-        let h = harness(completer, ApprovalPolicy::default());
+        let llm = Arc::new(
+            LLMClient::scripted(vec![final_answer("完成"), final_answer("完成")]).with_callbacks(
+                vec![Arc::new(Gate {
+                    marker: "【阻塞标记】".to_owned(),
+                    entered: entered.clone(),
+                    release: release.clone(),
+                })],
+            ),
+        );
+        let h = harness(llm, ApprovalPolicy::default());
         let blocked = h.manager.create(None).await.expect("create 失败");
         let free = h.manager.create(None).await.expect("create 失败");
 
@@ -874,14 +821,14 @@ mod tests {
 
     #[tokio::test]
     async fn suspension_survives_other_activity_and_stays_resumable() {
-        let completer = ScriptedCompleter::new(vec![
+        let llm = scripted(vec![
             call("call_probe", "probe", "{}"),
             // 第二个会话的收尾。
             final_answer("别的会话完成"),
             // 原会话 resume 后的收尾。
             final_answer("完成"),
         ]);
-        let h = harness(completer, ask_for("probe"));
+        let h = harness(llm, ask_for("probe"));
         let session = h.manager.create(None).await.expect("create 失败");
         send(&h.manager, &session.session_id, "跑一下")
             .await

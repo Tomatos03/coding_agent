@@ -1,8 +1,8 @@
 //! 端到端示例：用回调链在「请求前后」做观察掩蔽、窗口裁剪、动态注入与回复脱敏。
 //!
-//! 全程脚本化 `Completer` + 桩 `read_file` 工具，**无需任何凭证、可离线运行**。演示的
+//! 全程脚本化 `LLMClient` + 桩 `read_file` 工具，**无需任何凭证、可离线运行**。演示的
 //! 回调链按注册顺序为 `[Logger, MaskStaleObservations, SlidingWindowTrim, InjectContext,
-//! RedactReply]`：
+//! RedactReply, TransportLog]`：
 //!
 //! - `BeforeSend` **正序**依次跑；`AfterSend` **逆序**跑（洋葱模型），因此最外层的
 //!   `Logger` 在 `AfterSend` 里看到的是脱敏后的最终回复。
@@ -17,15 +17,15 @@
 //!   cargo run --example callback_react
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestMessage,
     ChatCompletionRequestToolMessageArgs, ChatCompletionRequestToolMessageContent,
     ChatCompletionRequestUserMessageArgs, FunctionCall,
 };
-use coding_agent::agent::llm::callback::{Callback, CallbackCompleter, CallbackEvent};
-use coding_agent::agent::llm::models::{Completer, Reply, ToolPolicy};
+use coding_agent::agent::llm::callback::{Callback, CallbackEvent};
+use coding_agent::agent::llm::models::{LLMClient, Reply};
 use coding_agent::agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::agent::react::runner::ReactLoop;
 use coding_agent::bootstrap::init;
@@ -92,74 +92,23 @@ impl Tool for ListFilesStub {
     }
 }
 
-/// 按预置队列返回回复的 `Completer`，并在每次请求时打印实际收到的消息概览，
-/// 用来证明回调的改动（注入 / 打桩 / 裁剪）确实到达了传输层。
-struct ScriptedCompleter {
-    replies: Mutex<Vec<Reply>>,
-}
-
-impl ScriptedCompleter {
-    fn new(replies: Vec<Reply>) -> Arc<Self> {
-        Arc::new(Self {
-            replies: Mutex::new(replies),
-        })
-    }
-
-    fn next(
-        &self,
-        messages: &[ChatCompletionRequestMessage],
-        on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
-    ) -> anyhow::Result<Reply> {
-        println!(
-            "  [传输层] 收到 {} 条消息 | {}",
-            messages.len(),
-            summarize(messages)
-        );
-        let reply = self
-            .replies
-            .lock()
-            .expect("脚本锁被毒化")
-            .pop_front_reply()?;
-        if !reply.content.is_empty() {
-            on_token(&reply.content);
-        }
-        Ok(reply)
-    }
-}
-
-/// `Vec::pop` 的一个小包装，避免在调用处写一长串 `remove(0)`。
-trait PopFrontReply {
-    fn pop_front_reply(&mut self) -> anyhow::Result<Reply>;
-}
-
-impl PopFrontReply for Vec<Reply> {
-    fn pop_front_reply(&mut self) -> anyhow::Result<Reply> {
-        if self.is_empty() {
-            anyhow::bail!("预置回复已用尽");
-        }
-        Ok(self.remove(0))
-    }
-}
+/// 假装自己是传输层：在 `BeforeSend` 打印最终发出去的消息概览。
+///
+/// 注册在回调链最内层——`BeforeSend` 最后执行，因此看到的就是传输层实际收到的版本，
+/// 用来证明前面的注入 / 打桩 / 裁剪确实送达了传输层。
+struct TransportLog;
 
 #[async_trait::async_trait]
-impl Completer for ScriptedCompleter {
-    async fn complete(
-        &self,
-        messages: &[ChatCompletionRequestMessage],
-        _tools: Option<&ToolHashMap>,
-        _policy: ToolPolicy,
-    ) -> anyhow::Result<Reply> {
-        self.next(messages, &mut |_| {})
-    }
-
-    async fn stream(
-        &self,
-        messages: &[ChatCompletionRequestMessage],
-        _tools: Option<&ToolHashMap>,
-        _policy: ToolPolicy,
-        on_token: &mut (dyn for<'a> FnMut(&'a str) + Send),
-    ) -> anyhow::Result<Reply> {
-        self.next(messages, on_token)
+impl Callback for TransportLog {
+    async fn call(&self, event: CallbackEvent<'_>) -> anyhow::Result<()> {
+        if let CallbackEvent::BeforeSend { messages } = event {
+            println!(
+                "  [传输层] 收到 {} 条消息 | {}",
+                messages.len(),
+                summarize(messages)
+            );
+        }
+        Ok(())
     }
 }
 
@@ -534,7 +483,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // 两轮读文件（可掩蔽）+ 三轮列目录（不可掩蔽，只能靠裁剪兜底）+ 一轮交付。
-    let scripted = ScriptedCompleter::new(vec![
+    let llm = LLMClient::scripted(vec![
         tool_call_reply("read_1", "read_file", json!({ "path": "a.rs" })),
         tool_call_reply("read_2", "read_file", json!({ "path": "b.rs" })),
         tool_call_reply("list_1", "list_files", json!({ "path": "." })),
@@ -555,10 +504,12 @@ async fn main() -> anyhow::Result<()> {
             "【注入】当前时间与检索片段（每轮不同，不落历史）",
         )),
         Arc::new(RedactReply(SECRET)),
+        // 最内层：BeforeSend 最后执行，看到的即传输层实际收到的版本。
+        Arc::new(TransportLog),
     ];
 
-    let completer: Arc<dyn Completer> = Arc::new(CallbackCompleter::new(scripted, callbacks));
-    let mut agent = ReactLoop::new(completer, tools, SYSTEM_PROMPT, DEFAULT_MAX_TURNS)?;
+    let llm: Arc<LLMClient> = Arc::new(llm.with_callbacks(callbacks));
+    let mut agent = ReactLoop::new(llm, tools, SYSTEM_PROMPT, DEFAULT_MAX_TURNS)?;
 
     println!("用户问题：读取文件与目录，给出总结。\n");
 

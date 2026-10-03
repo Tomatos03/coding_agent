@@ -1,11 +1,7 @@
 use std::sync::Arc;
 
 use coding_agent::{
-    agent::llm::{
-        models::{Completer, LLMClient},
-        provider,
-        semaphore::get_semaphore,
-    },
+    agent::llm::{models::LLMClient, provider, semaphore::get_semaphore},
     gaia::{
         dataset::load_gaia_level1,
         evaluator::{evaluate_gaia_with_tools, evaluate_gaia_without_tools},
@@ -35,17 +31,17 @@ async fn gaia_level1_experiment() -> anyhow::Result<()> {
         problems.len()
     );
 
-    let completer: Arc<dyn Completer> = Arc::new(LLMClient::from_model(&model)?);
+    let llm: Arc<LLMClient> = Arc::new(LLMClient::from_model(&model)?);
 
     let mut set = JoinSet::new();
     for problem in problems.iter().cloned() {
         let model = model.clone();
         let tools = tools.clone();
-        let completer = Arc::clone(&completer);
+        let llm = Arc::clone(&llm);
         set.spawn(async move {
             let permit = get_semaphore().acquire().await?;
             let without_tools = evaluate_gaia_without_tools(problem.clone(), &model).await;
-            let with_tools = evaluate_gaia_with_tools(problem, &model, completer, tools).await;
+            let with_tools = evaluate_gaia_with_tools(problem, &model, llm, tools).await;
             drop(permit);
             Ok::<_, anyhow::Error>((without_tools, with_tools))
         });
