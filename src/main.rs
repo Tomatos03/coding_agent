@@ -1,12 +1,12 @@
 //! 项目入口：组装并启动交互式 Agent（stdin/stdout REPL）。
 //!
-//! 循环逻辑（多轮会话、斜杠命令、审批挂起与恢复）都在库里的 `Agent::run`，
+//! 循环逻辑（多轮会话、斜杠命令、审批挂起与恢复）都在库里的 `Repl::run`，
 //! 这里只负责接线：
 //!
 //! 1. 组装 `Agent`：模型（`LLMClient`）、工具表（本地 + MCP）、system prompt、
 //!    审批策略（`.agents/settings.json`）与交互式确认方；
 //! 2. 实现 [`Console`]：决定「怎么读 stdin、怎么把 `Step` 显示到 stdout」；
-//! 3. 跑 `agent.run(&mut console)`，直到 EOF / `/quit`。
+//! 3. 跑 `repl.run(&mut console)`，直到 EOF / `/quit`。
 //!
 //! 运行（需要 LLM 凭证）：
 //!
@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use coding_agent::Agent;
 use coding_agent::Console;
+use coding_agent::Repl;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
 use coding_agent::llm::models::LLMClient;
@@ -83,12 +84,14 @@ async fn main() -> anyhow::Result<()> {
     .confirmer(Arc::new(confirmer))
     .in_memory();
 
+    let mut repl = Repl::new(agent);
+
     println!("agent running... 输入 /help 查看命令，/quit 退出。");
 
     let mut console = StdinConsole {
         input: BufReader::new(tokio::io::stdin()).lines(),
     };
-    agent.run(&mut console).await?;
+    repl.run(&mut console).await?;
 
     println!("再见。");
     Ok(())

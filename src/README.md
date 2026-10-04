@@ -1,12 +1,13 @@
 # 顶层组件
 
-crate 根下的顶层组件：把「一段消息进、一条回复出」的传输层，逐级组合成「多轮会话 + 审批挂起恢复」的顶层 `Agent`。纵向分四层，另有 `rag` 作为并列的独立切片：
+crate 根下的顶层组件：把「一段消息进、一条回复出」的传输层，逐级组合成「多轮会话 + 审批挂起恢复」的顶层 `Agent`，再由 `Repl` 包一层交互循环。纵向分五层，另有 `rag` 作为并列的独立切片：
 
 ```
-runtime（顶层 Agent）
-  └── session（会话注册表：每个 session 一个常驻 ReactLoop）
-        └── react（ReAct 循环：思考 → 行动 → 观察）
-              └── llm（传输层：LLMClient，唯一具体类型）
+repl（交互层：Repl 持有 Agent，负责 REPL 循环）
+  └── runtime（顶层 Agent）
+        └── session（会话注册表：每个 session 一个常驻 ReactLoop）
+              └── react（ReAct 循环：思考 → 行动 → 观察）
+                    └── llm（传输层：LLMClient，唯一具体类型）
 rag 并列存在，尚未接入循环
 ```
 
@@ -19,7 +20,8 @@ src/
 ├── llm/           # 传输层：LLMClient + 回调接缝 + provider / semaphore / test_support
 ├── react/         # 编排层：ReactLoop / History / 审批闸门 / 运行上下文
 ├── session/       # 会话层：SessionManager + 每会话一个常驻 ReactLoop
-├── runtime.rs     # 顶层：Agent / AgentBuilder / Console
+├── runtime.rs     # 顶层：Agent / AgentBuilder
+├── repl.rs        # 交互层：Repl / Console
 ├── rag/           # 独立切片：Embedder / InMemoryStore / Retriever（说明见 rag/README.md）
 └── assets/        # 本 README 的插图（containment.svg）
 ```
@@ -38,7 +40,8 @@ src/
 | `react/context.rs` | `ExecuteContext` · `Event` | 运行上下文：唯一 ID、`Status` 流转、逐轮事件流；`observe()` 序列化进 tracing |
 | `session/manager.rs` | `SessionManager` · `InMemorySessionManager` · `SessionRuntimeConfig` | 会话注册表：为每个会话持有常驻 `ReactLoop`，维护挂起标记与恢复游标 |
 | `session/models.rs` | `Session` · `SessionSummary` | 会话数据与摘要；标题 / 消息数 / 挂起态都从历史**派生** |
-| `runtime.rs` | `Agent` · `AgentBuilder` · `Console` | 顶层组件：组装 `SessionManager` 并对外委派；`Agent::run` 是交互循环，I/O 经 `Console` 挡在库外 |
+| `runtime.rs` | `Agent` · `AgentBuilder` | 顶层组件：组装 `SessionManager` 并对外委派 |
+| `repl.rs` | `Repl` · `Console` | 交互层：持有 `Agent` 的 REPL 循环，I/O 经 `Console` 挡在库外 |
 | `rag/` | `Embedder` · `InMemoryStore` · `Retriever` | 检索垂直切片，只与 `llm::provider` 的配置函数有交集；未接入循环 |
 
 ## 依赖与交互
@@ -46,9 +49,9 @@ src/
 依赖是单向的（上层依赖下层，`llm` 不反向依赖任何编排 / 会话类型）：
 
 ```
-runtime ──▶ session ──▶ react ──▶ llm
-                           │
-                           └──▶ tools（ToolHashMap / Tool::execute）
+repl ──▶ runtime ──▶ session ──▶ react ──▶ llm
+                                      │
+                                      └──▶ tools（ToolHashMap / Tool::execute）
 
 rag  ──▶ llm::provider（只借配置函数，无对话路径）
 gaia ──▶ react + llm::provider（带工具模式）；直答模式绕过 LLMClient
@@ -69,7 +72,7 @@ gaia ──▶ react + llm::provider（带工具模式）；直答模式绕过 L
 - `Agent::send` 委派 `SessionManager`：查 / 建会话 → 取常驻 `ReactLoop`（冷启动用 `from_history` 恢复）→ 跑一轮 → 回写 `History` 快照与 `state`；
 - 策略判 `ask` 而没有注入 `Confirmer`（或 `Confirmer` 返回 `Pending`）→ 本轮以 `Termination::Suspended` 正常结束，历史停在未配对的 `tool_call` 上；
 - `Agent::pending` 查看待审内容，`Agent::resume(decision)` 从中断处继续；挂起可无限期，期间不影响其它会话；
-- `Agent::run(&mut dyn Console)` 是交互式循环（`/sessions` `/switch` `/delete` `/resume`），示例见 `examples/react_chat.rs`。
+- `Repl::run(&mut dyn Console)` 是交互式循环（`/sessions` `/switch` `/delete` `/resume`），示例见 `examples/react_chat.rs`。
 
 ### 离线测试路径
 
@@ -89,7 +92,7 @@ gaia ──▶ react + llm::provider（带工具模式）；直答模式绕过 L
 ## 关键约定
 
 - **唯一传输层类型**。没有 `Completer` trait，也没有装饰器类型：回调链与脚本化后端都收在 `LLMClient` 内部；不注册回调时全链路与没有这层逐字节一致。
-- **单向依赖**。`runtime → session → react → llm`；`llm` 依赖具体领域类型或反向引用都会破坏离线测试与分层。
+- **单向依赖**。`repl → runtime → session → react → llm`；`llm` 依赖具体领域类型或反向引用都会破坏离线测试与分层。
 - **闸门与重试在调用方**。并发限流（`llm::semaphore`）与重试（`backon`，目前只有 GAIA 用）都不内置在传输层。
 - **`rag` 未接入循环**。当前是并列切片，未来可作为工具 / 观察通道。
 

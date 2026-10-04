@@ -202,12 +202,13 @@ pub struct ChatCompletionStreamResponseDelta {
 
 ## 11. Session 机制（多轮会话 / 多会话管理 / 审批挂起）
 
-`src/session/` 与 `src/runtime.rs` 把「一次 run」升级成「一段可管理的会话」。组件关系：
+`src/session/`、`src/runtime.rs` 与 `src/repl.rs` 把「一次 run」升级成「一段可管理的会话」。组件关系：
 
 ```
-Agent（runtime.rs：组装配置 + 委派）
-  └── SessionManager（session/manager.rs：会话注册表）
-        └── 每个 session 一个长期存活的 ReactLoop（多轮）
+Repl（repl.rs：交互循环，持有 Agent）
+  └── Agent（runtime.rs：组装配置 + 委派）
+        └── SessionManager（session/manager.rs：会话注册表）
+              └── 每个 session 一个长期存活的 ReactLoop（多轮）
 ```
 
 - **`Session`**（`session/models.rs`）就是你定的 schema：`session_id` / `user_id` / `history` / `state` / `created_at` / `updated_at`。**不额外存状态字段**：标题、消息数、挂起态全部从 `history` 派生（`title()` / `summary()` / `pending_call()`），schema 因此保持不动。`session/history` 的类型是 `Vec<ChatCompletionRequestMessage>`。
@@ -217,7 +218,7 @@ Agent（runtime.rs：组装配置 + 委派）
 - **并发**：外层 `std::sync::RwLock` 只做查表（临界区**绝不跨 await**），每个会话一把 `tokio::sync::Mutex` 在整轮 run 期间持有 → 同一 session 串行排队、不同 session 互不阻塞。写回因此不需要 CAS。
 - **`create` 时即写入 system prompt**，所以不存在「空历史」的会话；之后一律以历史里的 system 为准（历史即事实），换 prompt 不会追溯升级既有会话。
 - **本轮边界**：内存实现，退出即丢；跨重启保留要等文件后端（那时更可能把持久化拆成 `SessionStore` 挂在 manager 内部，而不是写一个把 loop 管理复制一遍的 `FileSessionManager`）。
-- **交互式循环住在 `Agent::run`**：读入 →（斜杠命令 | 追问）→ 驱动一轮 → 展示，直到输入结束或 `/quit`；当前会话（首次追问自动新建、`/new` `/switch` `/delete` 改它）由循环自己维护。I/O 通过 `Console` trait 挡在库外（`read_line` / `print` / `step`），`Agent` 因此仍是无隐式 IO 的库组件——示例接 stdin，测试接脚本化输入。单轮出错（网络、挂起态被追问……）只打印一行 `[错误]` 并继续循环；流式 token 暂不投递（`step` 已交付完整答案，同时投递会打印两遍）。
+- **交互式循环住在 `Repl::run`**（`Repl` 持有 `Agent`）：读入 →（斜杠命令 | 追问）→ 驱动一轮 → 展示，直到输入结束或 `/quit`；当前会话（首次追问自动新建、`/new` `/switch` `/delete` 改它）由循环自己维护。I/O 通过 `Console` trait 挡在库外（`read_line` / `print` / `step`），`Repl` / `Agent` 因此仍是无隐式 IO 的库组件——示例接 stdin，测试接脚本化输入。单轮出错（网络、挂起态被追问……）只打印一行 `[错误]` 并继续循环；流式 token 暂不投递（`step` 已交付完整答案，同时投递会打印两遍）。
 
 **HRTB 陷阱（改 `ReactLoop` 回调签名前必读）。** `ReactLoop::run` / `resume` 的回调参数**只能**是 `&mut (dyn for<'x> FnMut(&'x Step) + Send)`——不能是泛型 `impl FnMut(&Step)`。原因：session 层持有的是 trait object，而 `impl FnMut(&Step)` 与 `&mut dyn FnMut(&Step)` 之间隔着 `impl FnMut for &mut F` 这条泛型实现，编译器无法为它推出 `for<'a>` 绑定（报 `FnMut is not general enough` / `borrowed data escapes outside of closure`），连用闭包手工适配 `|step| on_step(step)` 也一样。所以只有一套入口，调用方传闭包时写 `&mut |..|`（回调必须 `Send`）。另外 `async_trait` 展开后会丢掉高阶绑定，`for<'x>` 必须显式写。
 

@@ -1,11 +1,11 @@
-//! 交互式会话 REPL：把 stdin/stdout 接到 [`Console`] 上，循环本身在 `Agent::run` 里。
+//! 交互式会话 REPL：把 stdin/stdout 接到 [`Console`] 上，循环本身在 `Repl::run` 里。
 //!
 //! 示例只负责三件事：
 //! 1. 组装 `Agent`（模型 / 工具 / system prompt / 审批策略 / 确认方）；
 //! 2. 实现 [`Console`]——「怎么读、怎么显示」；
 //! 3. 把 `--user` 与可选的首条提问转交进去。
 //!
-//! 循环逻辑（会话切换、斜杠命令、挂起提示、错误不中断）都在 `Agent::run`：
+//! 循环逻辑（会话切换、斜杠命令、挂起提示、错误不中断）都在 `Repl::run`：
 //!
 //! - 输入普通文字 = 对当前会话追问（同一份历史，模型能看到此前所有轮次）；
 //! - 审批闸门判 `ask` 时，你可以 `y` 批准、`n` 拒绝，或 `s` **挂起**——
@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use coding_agent::Agent;
 use coding_agent::Console;
+use coding_agent::Repl;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
 use coding_agent::llm::models::LLMClient;
@@ -111,11 +112,12 @@ async fn main() -> anyhow::Result<()> {
         println!("当前 user_id：{user}");
     }
 
+    let mut repl = Repl::new(agent);
     let mut console = StdinConsole {
         input: BufReader::new(tokio::io::stdin()).lines(),
         pending: initial.into(),
     };
-    agent.run(&mut console).await?;
+    repl.run(&mut console).await?;
 
     println!("再见。");
     Ok(())
