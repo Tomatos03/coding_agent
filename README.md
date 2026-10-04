@@ -6,24 +6,40 @@
 
 ```
 src/
-├── llm/              # 传输层：LLMClient、provider 配置、并发信号量、消息回调接缝
-├── rag/              # RAG 检索：embed / store / retriever（说明见 rag/README.md）
-├── react/            # ReAct 循环（runner/history/models/approval/context）
+├── main.rs           # 可执行入口（默认 bin；调用 bootstrap::init 后交给 Repl）
+├── lib.rs            # crate 根：模块声明与顶层 re-export（Agent / Repl 等）
+├── bootstrap.rs      # init()：dotenv + tracing 的统一初始化入口
 ├── runtime.rs        # 顶层 Agent：组装 SessionManager 并对外暴露 API
+├── settings.rs       # 危险工具审批策略（.agents/settings.json 的解析与匹配）
+├── llm/              # 传输层：LLMClient、provider 配置、并发信号量、消息回调接缝
+├── react/            # ReAct 循环（runner/history/models/approval/context；说明见 react/README.md）
 ├── session/          # 会话：Session / SessionManager（内存实现）
-├── README.md         # 顶层组件说明：包含关系与交互（插图在 assets/）
+├── repl/             # 交互层：Repl 三段循环（Reader/Evaluator/Writer）+ AgentEvaluator / 终端适配
+├── rag/              # RAG 检索：embed / store / retriever（说明见 rag/README.md）
 ├── tools/
 │   ├── tool.rs       # Tool trait
 │   ├── local/        # 本地（进程内）工具，每个工具一个子目录
 │   │   ├── web_search/
-│   │   └── final_answer/
-│   └── mcp/          # MCP 支持（远端工具）
+│   │   ├── final_answer/
+│   │   ├── list_files/
+│   │   ├── read_file/
+│   │   ├── write_file/
+│   │   ├── edit_file/
+│   │   ├── delete_files/
+│   │   ├── permission.rs      # 路径权限（workspace 模式）
+│   │   ├── workspace.rs       # 工作区边界逻辑
+│   │   └── anchor_registry.rs # 行锚点分配式账本
+│   └── mcp/          # MCP 支持（远端工具，说明见 mcp/README.md）
 │       ├── config.rs     # mcp.json 解析与校验
 │       ├── connection.rs # 启动子进程、握手、工具发现
 │       └── tool.rs       # 远端工具 -> 本地 Tool 适配
-├── settings.rs       # 危险工具审批策略（.agents/settings.json 的解析与匹配）
 ├── gaia/             # GAIA 数据集评测
-└── constant/         # 常量与 prompt
+├── constant/         # 常量与 prompt
+├── utils/            # 纯函数（crate 内部）：哈希 / 文本归一化 / 锚点编解码 / JSON Schema 后处理
+├── bin/
+│   └── gaia.rs       # GAIA 评测可执行目标
+├── assets/           # 顶层 README 插图（containment.svg）
+└── README.md         # 顶层组件说明：包含关系与交互
 examples/             # 可运行示例
 tests/fixtures/       # 测试用假 MCP server（Python）
 ```
@@ -224,6 +240,16 @@ cargo run --example rag_chat -- "余弦相似度怎么算？"
 # 真实 LLM + MCP：先准备好 mcp.json 与 .env（会真实调用 LLM）
 cargo run --example mcp_chat
 cargo run --example mcp_chat -- "用 MCP 的 echo 工具确认链路"
+
+# 离线回调链演示：请求前后做观察掩蔽 / 窗口裁剪 / 动态注入 / 回复脱敏（脚本化，无需凭证）
+cargo run --example callback_react
+
+# 传输层直用：真实 LLM 流式输出 / 进程级并发信号量（会真实调用 LLM，需要 .env）
+cargo run --example stream_chat
+cargo run --example semaphore_chat
+
+# web_search 本地工具独立示例（需要 TAVILY_API_KEY）
+cargo run --example web_search
 
 # 查看当前注册的工具表
 cargo run --example tool_exec -- "rust async"
