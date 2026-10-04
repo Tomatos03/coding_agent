@@ -59,7 +59,7 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 
 `src/llm/callback.rs` 8 个（全部离线；假内层传输层记录收到的消息并返回预置 `Reply`，假回调按事件记录轨迹）：`BeforeSend` 注入的消息送达内层；`AfterSend` 改写的 `Reply` 出现在返回值里；空回调列表 = 透传；洋葱顺序 `[outer:before, inner:before, inner:after, outer:after]` 且两层互相可见对方的改动；`BeforeSend` 报错时整个请求中止且内层**未被调用**（fail-closed）；`AfterSend` 报错即便回复已到手也传播；只处理 `BeforeSend` 的放行模板照常参与全链（两个事件都会送达）；stream 路径同样派发两种事件且 `on_token` 直通不受影响。
 
-Session 相关 22 个（全部离线）：`src/session/models.rs` 4 个（标题按字符截断 / `pending_call` 从历史推导的四种形态 / 摘要带挂起标记 / serde round-trip）；`src/session/manager.rs` 11 个（create 唯一且只含 system、get/delete 的缺失语义、list 过滤与排序、多轮累积历史、**挂起并写 `state.turn`**、resume 批准恰好执行一次、resume 拒绝压成 Observation、挂起态 `send` 与非挂起态 `resume` 都报错、**同会话并发串行不丢消息**、**不同会话互不阻塞**（用 Notify 门控证明）、**挂起无限期可恢复**）；`src/runtime.rs` 3 个（`default_user` 落到会话、builder 默认全放行、`Agent` 委派与 manager 一致）；`src/repl.rs` 4 个（**`Repl::run` 的循环**：首次追问自动建会话并报答案、斜杠命令分发与 `/quit` 收尾、挂起提示 + `/resume y` 继续、单轮出错只打印并继续——脚本化 `Console` 驱动，不碰真实终端）。
+Session 相关 23 个（全部离线）：`src/session/models.rs` 4 个（标题按字符截断 / `pending_call` 从历史推导的四种形态 / 摘要带挂起标记 / serde round-trip）；`src/session/manager.rs` 11 个（create 唯一且只含 system、get/delete 的缺失语义、list 过滤与排序、多轮累积历史、**挂起并写 `state.turn`**、resume 批准恰好执行一次、resume 拒绝压成 Observation、挂起态 `send` 与非挂起态 `resume` 都报错、**同会话并发串行不丢消息**、**不同会话互不阻塞**（用 Notify 门控证明）、**挂起无限期可恢复**）；`src/runtime.rs` 3 个（`default_user` 落到会话、builder 默认全放行、`Agent` 委派与 manager 一致）；`src/repl/agent.rs` 4 个（**内置 `AgentEvaluator`**：首次追问自动建会话并报答案、斜杠命令分发与 `/quit` 产出 `Output::Quit`、挂起提示 + `/resume y` 继续、单轮出错折成输出并继续——脚本化 `Writer` 收输出，不碰真实终端）；`src/repl/terminal.rs` 1 个（`with_pending` 的预置输入按序先于 stdin 吐出）。
 
 `src/tools/local/final_answer/mod.rs` 5 个：`execute` 把输入参数原样返回、可重复调用（纯函数）、`extract_answer` 容忍首尾空白、拒绝非法 JSON / 缺字段 / 空串、`execute` 传播解析错误。
 

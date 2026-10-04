@@ -3,7 +3,8 @@
 //! `Agent` 自己不跑循环——多轮、挂起、恢复都在
 //! [`SessionManager`](crate::session::manager::SessionManager) 里，
 //! 因为「每个 session 一个常驻 `ReactLoop`」这件事由它持有；
-//! 交互式 REPL 循环在 [`Repl`](crate::repl::Repl)，`Agent` 只组装配置、委派会话操作。
+//! 交互式循环由 [`Repl`](crate::repl::Repl) 驱动、交互协议在
+//! [`AgentEvaluator`](crate::repl::AgentEvaluator)，`Agent` 只组装配置、委派会话操作。
 
 use std::sync::Arc;
 

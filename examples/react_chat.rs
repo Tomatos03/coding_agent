@@ -1,11 +1,13 @@
-//! 交互式会话 REPL：把 stdin/stdout 接到 [`Console`] 上，循环本身在 `Repl::run` 里。
+//! 交互式会话 REPL：用库自带的 `StdinReader` / `StdoutWriter` 接 stdin/stdout，
+//! 循环骨架在库里的 `Repl`（读取 → 评估 → 输出），交互协议（斜杠命令、挂起恢复）
+//! 在内置的 `AgentEvaluator` 里。
 //!
 //! 示例只负责三件事：
 //! 1. 组装 `Agent`（模型 / 工具 / system prompt / 审批策略 / 确认方）；
-//! 2. 实现 [`Console`]——「怎么读、怎么显示」；
+//! 2. 用库自带的终端适配（`StdinReader` / `StdoutWriter`）；
 //! 3. 把 `--user` 与可选的首条提问转交进去。
 //!
-//! 循环逻辑（会话切换、斜杠命令、挂起提示、错误不中断）都在 `Repl::run`：
+//! `AgentEvaluator` 负责会话切换、斜杠命令、挂起提示与错误不中断：
 //!
 //! - 输入普通文字 = 对当前会话追问（同一份历史，模型能看到此前所有轮次）；
 //! - 审批闸门判 `ask` 时，你可以 `y` 批准、`n` 拒绝，或 `s` **挂起**——
@@ -18,61 +20,16 @@
 //!   cargo run --example react_chat
 //!   cargo run --example react_chat -- --user alice "先读一下 README"
 
-use std::collections::VecDeque;
-use std::io::Write;
 use std::sync::Arc;
 
-use coding_agent::Agent;
-use coding_agent::Console;
-use coding_agent::Repl;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
 use coding_agent::llm::models::LLMClient;
 use coding_agent::react::approval::TerminalConfirmer;
-use coding_agent::react::models::{DEFAULT_MAX_TURNS, Step};
+use coding_agent::react::models::DEFAULT_MAX_TURNS;
 use coding_agent::settings::load_settings;
 use coding_agent::tools::build_tools;
-use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
-
-/// 把 stdin/stdout 接到 [`Console`]：库里决定「什么时候读」，这里只决定「怎么读、怎么显示」。
-/// 确认方（`TerminalConfirmer`）直接读 stdin，不经过这里。
-struct StdinConsole {
-    input: Lines<BufReader<Stdin>>,
-    /// 命令行上的位置参数：作为首条提问先喂给循环，之后再读 stdin。
-    pending: VecDeque<String>,
-}
-
-#[async_trait::async_trait]
-impl Console for StdinConsole {
-    async fn read_line(&mut self) -> Option<String> {
-        if let Some(line) = self.pending.pop_front() {
-            println!("\n> {line}");
-            return Some(line);
-        }
-        print!("\n> ");
-        let _ = std::io::stdout().flush();
-        self.input.next_line().await.ok().flatten()
-    }
-
-    fn print(&mut self, line: &str) {
-        println!("{line}");
-    }
-
-    fn step(&mut self, step: &Step) {
-        match step {
-            Step::Thought { turn, content } => println!("[{turn}] 思考：{content}"),
-            Step::Answer { turn, content } => println!("\n[{turn}] 答案：{content}"),
-            Step::Action {
-                turn,
-                name,
-                arguments,
-            } => println!("[{turn}] 调用：{name} 参数 {arguments}"),
-            Step::Observation { turn, name, output } => {
-                println!("[{turn}] {name} 返回：{output}");
-            }
-        }
-    }
-}
+use coding_agent::{Agent, AgentEvaluator, Repl, StdinReader, StdoutWriter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -112,12 +69,11 @@ async fn main() -> anyhow::Result<()> {
         println!("当前 user_id：{user}");
     }
 
-    let mut repl = Repl::new(agent);
-    let mut console = StdinConsole {
-        input: BufReader::new(tokio::io::stdin()).lines(),
-        pending: initial.into(),
-    };
-    repl.run(&mut console).await?;
+    let evaluator = AgentEvaluator::new(agent);
+    let reader = StdinReader::with_pending(initial);
+    let writer = StdoutWriter;
+    let mut repl = Repl::new(reader, evaluator, writer);
+    repl.run().await?;
 
     println!("再见。");
     Ok(())

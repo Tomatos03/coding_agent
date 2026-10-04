@@ -235,7 +235,7 @@ cargo run --bin gaia
 
 ## Session 机制（多轮 / 多会话 / 审批挂起）
 
-`Agent`（`src/runtime.rs`）持有 `SessionManager`，每个 session 对应一个常驻的 `ReactLoop`，因此「带着已有历史继续追问」是天然的。交互式循环是单独的 `Repl` 组件（`src/repl.rs`）：它持有一个 `Agent`，负责读入 → 命令 / 追问分发 → 驱动 → 展示，`Console` 把 I/O 挡在库外（示例接 stdin，测试接脚本化输入）。`Session` 存完整对话历史与调用方自定义的 `state`；标题、消息数、挂起态都从历史**派生**，不额外存字段。
+`Agent`（`src/runtime.rs`）持有 `SessionManager`，每个 session 对应一个常驻的 `ReactLoop`，因此「带着已有历史继续追问」是天然的。交互层是单独的 `repl` 组件（`src/repl/`）：`Repl` 写死读取 → 评估 → 输出，三段（`Reader` / `Evaluator` / `Writer`）都是扩展点；内置的 `AgentEvaluator` 解析并执行斜杠命令、维护会话，普通输入驱动一轮 ReAct，I/O 与交互协议因此都挡在库外（示例接 stdin，测试接脚本化输入）。`Session` 存完整对话历史与调用方自定义的 `state`；标题、消息数、挂起态都从历史**派生**，不额外存字段。
 
 审批闸门判 `ask` 时：注入了 `Confirmer` 就问它，它可以选择「稍后决定」（`Decision::Pending`）；没有注入 `Confirmer` 则直接**挂起**——会话停在未执行完的工具批次上正常返回（`Termination::Suspended`），**无限期等待**，直到显式 `resume`（批准 / 拒绝）才从中断处继续。挂起期间可以切走、新建 / 删除其它会话，不会影响它；`/sessions` 会标出哪些会话在等审批。
 

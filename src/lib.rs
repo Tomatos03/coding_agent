@@ -11,5 +11,7 @@ pub mod settings;
 pub mod tools;
 pub(crate) mod utils;
 
-pub use repl::{Console, Repl};
+pub use repl::{
+    AgentEvaluator, Emit, Evaluator, Output, Reader, Repl, StdinReader, StdoutWriter, Writer,
+};
 pub use runtime::{Agent, AgentBuilder};

@@ -56,7 +56,7 @@ src/tools/         工具层：spec / execute
 | `src/constant/` | 按领域分的字面量常量：`provider.rs`（provider 名与凭证环境变量名）、`prompt.rs`（`SYSTEM_PROMPT`）、`gaia.rs`（评测参数）、`embedding.rs`（embedding 端点与模型的环境变量名）。模型 ID 本身走 `CURRENT_USE_MODEL_ID`，不硬编码 |
 | `src/bootstrap.rs` | dotenv + tracing 的统一初始化入口 |
 
-可执行入口：`src/main.rs`（交互式 Agent REPL：接线 stdin/stdout + 交互确认方后跑 `Repl::run`）、`src/bin/gaia.rs`（GAIA 对比评测：每题各跑一次「带工具 / 不带工具」，输出两组通过数与通过率）。`examples/` 下九个：
+可执行入口：`src/main.rs`（交互式 Agent REPL：接线 stdin/stdout + 交互确认方后跑 `Repl::new(reader, evaluator, writer).run()`，内置 `AgentEvaluator`）、`src/bin/gaia.rs`（GAIA 对比评测：每题各跑一次「带工具 / 不带工具」，输出两组通过数与通过率）。`examples/` 下九个：
 
 | 示例 | 演示什么 |
 |---|---|

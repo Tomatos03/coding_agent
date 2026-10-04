@@ -1,9 +1,9 @@
 # 顶层组件
 
-crate 根下的顶层组件：把「一段消息进、一条回复出」的传输层，逐级组合成「多轮会话 + 审批挂起恢复」的顶层 `Agent`，再由 `Repl` 包一层交互循环。纵向分五层，另有 `rag` 作为并列的独立切片：
+crate 根下的顶层组件：把「一段消息进、一条回复出」的传输层，逐级组合成「多轮会话 + 审批挂起恢复」的顶层 `Agent`，再由 `Repl` 组件写死的三段循环（`Reader` / `Evaluator` / `Writer`）接上交互。纵向分五层，另有 `rag` 作为并列的独立切片：
 
 ```
-repl（交互层：Repl 持有 Agent，负责 REPL 循环）
+repl（交互层：Repl 组件写死读取 → 评估 → 输出；内置 AgentEvaluator）
   └── runtime（顶层 Agent）
         └── session（会话注册表：每个 session 一个常驻 ReactLoop）
               └── react（ReAct 循环：思考 → 行动 → 观察）
@@ -21,7 +21,7 @@ src/
 ├── react/         # 编排层：ReactLoop / History / 审批闸门 / 运行上下文
 ├── session/       # 会话层：SessionManager + 每会话一个常驻 ReactLoop
 ├── runtime.rs     # 顶层：Agent / AgentBuilder
-├── repl.rs        # 交互层：Repl / Console
+├── repl/          # 交互层：Repl 循环 + 内置 AgentEvaluator / 终端适配
 ├── rag/           # 独立切片：Embedder / InMemoryStore / Retriever（说明见 rag/README.md）
 └── assets/        # 本 README 的插图（containment.svg）
 ```
@@ -41,7 +41,7 @@ src/
 | `session/manager.rs` | `SessionManager` · `InMemorySessionManager` · `SessionRuntimeConfig` | 会话注册表：为每个会话持有常驻 `ReactLoop`，维护挂起标记与恢复游标 |
 | `session/models.rs` | `Session` · `SessionSummary` | 会话数据与摘要；标题 / 消息数 / 挂起态都从历史**派生** |
 | `runtime.rs` | `Agent` · `AgentBuilder` | 顶层组件：组装 `SessionManager` 并对外委派 |
-| `repl.rs` | `Repl` · `Console` | 交互层：持有 `Agent` 的 REPL 循环，I/O 经 `Console` 挡在库外 |
+| `repl/mod.rs` · `repl/agent.rs` · `repl/terminal.rs` | `Repl` · `Reader` · `Evaluator` · `Writer` · `AgentEvaluator` · `StdinReader` · `StdoutWriter` | 交互层：`Repl` 写死读取 → 评估 → 输出；`AgentEvaluator` 解析并执行斜杠命令、维护会话、驱动一轮 ReAct；`terminal.rs` 是现成的 stdin/stdout 适配 |
 | `rag/` | `Embedder` · `InMemoryStore` · `Retriever` | 检索垂直切片，只与 `llm::provider` 的配置函数有交集；未接入循环 |
 
 ## 依赖与交互
@@ -72,7 +72,7 @@ gaia ──▶ react + llm::provider（带工具模式）；直答模式绕过 L
 - `Agent::send` 委派 `SessionManager`：查 / 建会话 → 取常驻 `ReactLoop`（冷启动用 `from_history` 恢复）→ 跑一轮 → 回写 `History` 快照与 `state`；
 - 策略判 `ask` 而没有注入 `Confirmer`（或 `Confirmer` 返回 `Pending`）→ 本轮以 `Termination::Suspended` 正常结束，历史停在未配对的 `tool_call` 上；
 - `Agent::pending` 查看待审内容，`Agent::resume(decision)` 从中断处继续；挂起可无限期，期间不影响其它会话；
-- `Repl::run(&mut dyn Console)` 是交互式循环（`/sessions` `/switch` `/delete` `/resume`），示例见 `examples/react_chat.rs`。
+- `Repl::new(reader, AgentEvaluator::new(agent), writer).run()` 是交互式循环（`/sessions` `/switch` `/delete` `/resume`），示例见 `examples/react_chat.rs`。
 
 ### 离线测试路径
 
