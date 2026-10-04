@@ -10,8 +10,7 @@
 //!   cargo run --example mcp_react
 //!   cargo run --example mcp_react -- npx -y @modelcontextprotocol/server-everything
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, FunctionCall,
@@ -19,49 +18,13 @@ use async_openai::types::chat::{
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
 use coding_agent::llm::models::{LLMClient, Reply};
-use coding_agent::react::approval::{ApprovalRequest, Confirmer, Decision};
+use coding_agent::react::approval::{Confirmer, Decision};
 use coding_agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::react::runner::ReactLoop;
 use coding_agent::settings::{ApprovalAction, ApprovalPolicy, ApprovalRule};
 use coding_agent::tools::build_tools_with;
 use coding_agent::tools::local::final_answer::FINAL_ANSWER_TOOL;
 use coding_agent::tools::mcp::{McpConfig, McpServerConfig};
-
-/// 脚本化确认方：按预置队列依次给出决策，并打印每次询问（替代人工确认）。
-struct ScriptedConfirmer {
-    decisions: Mutex<VecDeque<Decision>>,
-}
-
-impl ScriptedConfirmer {
-    fn new(decisions: Vec<Decision>) -> Self {
-        Self {
-            decisions: Mutex::new(decisions.into()),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl Confirmer for ScriptedConfirmer {
-    async fn confirm(&self, request: &ApprovalRequest) -> Decision {
-        let decision = self
-            .decisions
-            .lock()
-            .expect("脚本锁被毒化")
-            .pop_front()
-            .expect("预置确认决策已用尽");
-        let label = match decision {
-            Decision::Approve => "批准",
-            Decision::Deny => "拒绝",
-            // 脚本确认方不会返回它；挂起路径的演示见 session 机制的示例。
-            Decision::Pending => "稍后决定（挂起）",
-        };
-        println!(
-            "[确认] 工具 `{}` 参数 {}（脚本决策：{label}）",
-            request.tool, request.arguments
-        );
-        decision
-    }
-}
 
 /// 构造一条「思考 + 调用某个工具」的回复。
 fn mcp_tool_call(id: &str, tool_name: &str, arguments: &str) -> Reply {
@@ -162,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
         }],
         ..Default::default()
     };
-    let confirmer = ScriptedConfirmer::new(vec![Decision::Deny, Decision::Approve]);
+    let confirmer = Confirmer::scripted(vec![Decision::Deny, Decision::Approve]);
 
     let mut agent = ReactLoop::new(Arc::new(llm), tools, SYSTEM_PROMPT, DEFAULT_MAX_TURNS)?
         .with_approval_policy(policy)

@@ -12,7 +12,7 @@ ReAct（Reason + Act）主循环的垂直切片：思考 → 行动 → 观察�
 | `History` | `history.rs` | 消息序列的薄封装：`system` / `user` / `assistant` / `tool` + `as_slice` |
 | `Step` / `Termination` / `Outcome` | `models.rs` | 编排层词汇：轨迹事件、终止原因、运行结果；`DEFAULT_MAX_TURNS = 12` 也在这里 |
 | `ExecuteContext` / `Event` | `context.rs` | 执行上下文：唯一 ID、`Status` 流转、当前轮事件流（`set_turn` 只保留当前轮）；由 `observe()` 逐轮序列化进 tracing |
-| `Confirmer` / `ApprovalRequest` / `Decision` | `approval.rs` | 确认接缝：策略判 `ask` 时循环经它拿决定；问谁、怎么问、要不要记住由实现决定 |
+| `Confirmer` / `ApprovalRequest` / `Decision` | `approval.rs` | 确认接缝：策略判 `ask` 时循环经它拿决定；问谁、怎么问由构造时注入的应答器决定，脚本化模式记录请求快照 |
 
 ![ReAct 模块组件与交互流程](assets/flow.svg)
 
@@ -50,7 +50,7 @@ ReAct（Reason + Act）主循环的垂直切片：思考 → 行动 → 观察�
 - **撞轮次上限走软收尾，不 `bail!`**。直接报错会把整轮探索的成果扔掉；收尾的三种失败情形一律软着陆。
 - **`final_answer` 是普通可执行工具**，不是 `execute` 之前的特殊分支：它的 `execute` 输入即输出，循环用统一的 action → Observation 路径拿到答案，配对消息天然成立；`extract_answer` / `execute` 都是纯函数，可安全重复调用。
 - **循环内每轮 `tool_choice = required`**，`content` 永远只是 thought；端点以 400 拒绝时真实后端置粘性标记、降级为 `Auto` 重发（见 `llm` 模块）。
-- **审批闸门在 dispatch 之前**：`action()` 发完 `Step::Action` 后查策略，判 `ask` 时经 `Confirmer` 拿决定；拒绝走与「工具失败 / 未知工具」完全相同的通道（压成 Observation），循环继续、配对消息照常——不变量①②不受影响。策略判 `ask` 但未注入 `confirmer` 时**拒绝执行**（fail-closed）。闸门只按暴露名判 glob，参数级粒度由 `Confirmer` 自己拿 `arguments` 判断；`final_answer` 的交付路径与收尾轮不执行工具，天然豁免。
+- **审批闸门在 dispatch 之前**：`action()` 发完 `Step::Action` 后查策略，判 `ask` 时经 `Confirmer` 拿决定；拒绝走与「工具失败 / 未知工具」完全相同的通道（压成 Observation），循环继续、配对消息照常——不变量①②不受影响。策略判 `ask` 但未注入 `confirmer` 时**挂起**（`Termination::Suspended`，与主动返回 `Decision::Pending` 同一条路径）。闸门只按暴露名判 glob，参数级粒度由 `Confirmer` 自己拿 `arguments` 判断；`final_answer` 的交付路径与收尾轮不执行工具，天然豁免。
 - **`Step::Thought` 与 `Step::Answer` 互斥**，判据 `calls.is_empty()` 必须先于发射——顺序写反会把最终答案错标成 Thinking。这条由按轮次断言事件序列的测试钉住。
 - **流式与「区分思考 / 答案」不可兼得**，这是物理限制：token 到达时，这一轮会不会有 `tool_calls` 还不知道。要逐字输出用 `on_token`（内容统一渲染），要分得清用 `on_step`（整段到达）；`react_chat` 只消费 `on_step`。
 
@@ -64,7 +64,7 @@ ReAct（Reason + Act）主循环的垂直切片：思考 → 行动 → 观察�
 
 ## 测试
 
-- 离线：`cargo test --lib` —— `runner.rs` 21 个覆盖循环逻辑：交付三态（参数即答案 / 与兄弟调用并存 / 消息全配对）、降级路径（纯文本 / 空回复 / 端点无视强制）、工具失败与未知工具压成 Observation、`final_answer` 参数非法重试、撞上限的强制收尾与工具面裁剪、软着陆三态、`Step` 发射顺序、审批闸门四态（拒绝压成 Observation 且不执行 / 批准照常执行 / 无 confirmer 时 fail-closed / allow 不咨询 confirmer）
+- 离线：`cargo test --lib` —— `runner.rs` 21 个覆盖循环逻辑：交付三态（参数即答案 / 与兄弟调用并存 / 消息全配对）、降级路径（纯文本 / 空回复 / 端点无视强制）、工具失败与未知工具压成 Observation、`final_answer` 参数非法重试、撞上限的强制收尾与工具面裁剪、软着陆三态、`Step` 发射顺序、审批闸门四态（拒绝压成 Observation 且不执行 / 批准照常执行 / 无 confirmer 时挂起 / allow 不咨询 confirmer）
 - `settings.rs` 11 个：配置解析（完整 / 空对象 / 默认值 / 非法 action / 空 pattern 拒绝 / 未知字段拒绝 / 缺文件回退）与匹配表（精确、前后缀通配、裸 `*`、首行锚定、规则顺序、`defaultAction` 回退）
 - `context.rs` 6 个：唯一 ID、状态流转、事件序列化（平铺 JSON、毫秒时间戳）、`set_turn` 只留当前轮、插入顺序
-- 接缝：`LLMClient::scripted` 的脚本化后端（预置响应队列，同时记录策略、工具面与消息）+ `EchoTool` + `ScriptedConfirmer`（预置决策队列，记录调用次数与请求）替掉真实网络与人工输入，全部离线
+- 接缝：`LLMClient::scripted` 的脚本化后端（预置响应队列，同时记录策略、工具面与消息）+ `EchoTool` + `Confirmer::scripted`（预置决策队列，`scripted_requests()` 取回请求快照）替掉真实网络与人工输入，全部离线

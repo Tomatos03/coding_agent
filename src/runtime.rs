@@ -394,7 +394,7 @@ pub struct AgentBuilder {
     system_prompt: String,
     max_turns: usize,
     approval_policy: ApprovalPolicy,
-    confirmer: Option<Arc<dyn Confirmer>>,
+    confirmer: Option<Arc<Confirmer>>,
     default_user_id: Option<String>,
 }
 
@@ -404,7 +404,7 @@ impl AgentBuilder {
         self
     }
 
-    pub fn confirmer(mut self, confirmer: Arc<dyn Confirmer>) -> Self {
+    pub fn confirmer(mut self, confirmer: Arc<Confirmer>) -> Self {
         self.confirmer = Some(confirmer);
         self
     }

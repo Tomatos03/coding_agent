@@ -86,7 +86,7 @@ async fn execute(&self, name: &str, arguments: &str) -> String
 
 `src/tools/local/final_answer/mod.rs` 的 `execute` **输入即输出**：解析 `answer` 参数后原样返回。于是循环用统一的 `action → execute → Observation` 路径就能拿到最终答案，每个 `tool_call` 也天然有配对 tool 消息（不变量②）。循环的终止判据是「参数可解析」（`extract_answer`），交付值取 `execute` 的返回值——两者同源、必然一致。**若改成「在 `execute` 之前拦截、跳过执行」，同轮其它 `tool_call` 就会失去配对 tool 消息。** `extract_answer` / `execute` 必须是纯函数：给这个工具加副作用会破坏「可安全重复调用」这条隐含约定。
 
-**审批闸门（危险工具确认）在 `run_pending_calls()` 里、`Step::Action` 之后、`execute()` 之前。** `ReactLoop` 持有 `approval_policy`（来自工作区根目录的 `.agents/settings.json`，经 `src/settings.rs` 的 `load_settings()` 加载；缺文件 = 全默认 = 全放行）与可选 `confirmer`（`src/react/approval.rs` 的 `Confirmer` trait）。`action_for(name)` 判 `ask` 时经 `Confirmer` 拿决定：**拒绝被压成一条 Observation**（「用户拒绝执行工具…」）——它不是 `Err`、也不是 `execute` 之前的特例分支，而是与「工具失败 / 未知工具」完全相同的通道，不变量①②原样成立，消费方不用学新事件类型。两条静默陷阱：**(a)** 策略判 `ask` 但调用方未注入 `confirmer` 时**挂起**（`Termination::Suspended`），不再 fail-closed 直接拒绝——会话停在未执行完的工具批次上，等 session 层带决定 `resume`（`Confirmer` 主动返回 `Decision::Pending` 走同一条路；这是行为变更，详见第 11 节）；**(b)** 匹配只按**暴露名**做 glob（`*` 通配任意字符序列；`*__*` 恰命中一切 MCP 工具），参数级粒度（rm 拦、ls 放行）留给 `Confirmer` 自己看 `arguments`。豁免路径无需特判：`final_answer` 的交付路径与 `finalize()` 都不执行工具，结构上到不了闸门。`ReactLoop` 只收算好的 `ApprovalPolicy` / `Confirmer` 对象，自己不读文件——与「收 `ToolHashMap` 而不跑 `build_tools()`」同一条原则；配置启动时读一次，改完重启生效（与 `mcp.json` 一致）。
+**审批闸门（危险工具确认）在 `run_pending_calls()` 里、`Step::Action` 之后、`execute()` 之前。** `ReactLoop` 持有 `approval_policy`（来自工作区根目录的 `.agents/settings.json`，经 `src/settings.rs` 的 `load_settings()` 加载；缺文件 = 全默认 = 全放行）而可选 `confirmer`（`src/react/approval.rs` 的 `Confirmer` 类型）。`action_for(name)` 判 `ask` 时经 `Confirmer` 拿决定：**拒绝被压成一条 Observation**（「用户拒绝执行工具…」）——它不是 `Err`、也不是 `execute` 之前的特例分支，而是与「工具失败 / 未知工具」完全相同的通道，不变量①②原样成立，消费方不用学新事件类型。两条静默陷阱：**(a)** 策略判 `ask` 但调用方未注入 `confirmer` 时**挂起**（`Termination::Suspended`），不再 fail-closed 直接拒绝——会话停在未执行完的工具批次上，等 session 层带决定 `resume`（`Confirmer` 主动返回 `Decision::Pending` 走同一条路；这是行为变更，详见第 11 节）；**(b)** 匹配只按**暴露名**做 glob（`*` 通配任意字符序列；`*__*` 恰命中一切 MCP 工具），参数级粒度（rm 拦、ls 放行）留给 `Confirmer` 自己看 `arguments`。豁免路径无需特判：`final_answer` 的交付路径与 `finalize()` 都不执行工具，结构上到不了闸门。`ReactLoop` 只收算好的 `ApprovalPolicy` / `Confirmer` 对象，自己不读文件——与「收 `ToolHashMap` 而不跑 `build_tools()`」同一条原则；配置启动时读一次，改完重启生效（与 `mcp.json` 一致）。
 
 **循环内每轮都是 `tool_choice=required`。** 服务端保证回复里至少有一个 `tool_call`，所以模型**只能**靠 `final_answer` 结束，`content` 永远只是 thought。两条降级路径兜底：(a) 回复里没有 `tool_calls` → 端点无视了强制，把 `content` 当答案收尾（`Termination::ModelFinished`）；(b) 端点以 400 明确拒绝 `tool_choice` → 真实后端置粘性标记（`AtomicBool`）、改用 `Auto` 重发一次，此后所有请求都不再强制。`ToolPolicy`（`Auto` / `Required` / `Force(name)`）是请求级参数，随每轮传入 `LLMClient`，不能写进 messages。
 
@@ -192,7 +192,7 @@ pub struct ChatCompletionStreamResponseDelta {
 
 **线上 ≠ 存档（最关键的语义）。** `BeforeSend` 改的是「寄出去的信」：每轮从当前 `History` 重新克隆、重新派发，改动**不落历史**——这正是「发出去的比存下来的少」的裁剪刚需。`AfterSend` 改的是「回信」：`Reply` 回到 `ReactLoop` 后会原样落历史并驱动后续（改掉的 `tool_calls` 会被执行），因此它是**持久**的。想持久注入（如 RAG 片段要留给后续轮次）就不该用回调，那属于 `History` 的职责。
 
-**fail-closed。** 任一回调返回 `Err`，整个请求失败并向上传播（`BeforeSend` 报错时内层传输层**不会**被调用）——与审批闸门「要问但无人可问 → 拒绝」同一姿态。想「尽力而为」的实现应自己吞错（`tracing::warn!` 后返回 `Ok(())`）。流式下 `AfterSend` 报错时 token 可能已经打出去，无法回滚。
+**fail-closed。** 任一回调返回 `Err`，整个请求失败并向上传播（`BeforeSend` 报错时内层传输层**不会**被调用）——与审批闸门「要问但无人可问 → 挂起、不执行」同一姿态。想「尽力而为」的实现应自己吞错（`tracing::warn!` 后返回 `Ok(())`）。流式下 `AfterSend` 报错时 token 可能已经打出去，无法回滚。
 
 **与四个不变量的关系。** 变异发生在 `ReactLoop` 看到 `Reply` **之前**，配对消息与终止判定都在最终值上计算；`AfterSend` 若删光 `tool_calls` 且 `content` 为空，会自然落入既有的 `Termination::EmptyReply`，不需要新分支。
 

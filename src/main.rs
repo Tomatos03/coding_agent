@@ -24,7 +24,7 @@ use coding_agent::Console;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
 use coding_agent::llm::models::LLMClient;
-use coding_agent::react::approval::{ApprovalRequest, Confirmer, Decision};
+use coding_agent::react::approval::{Confirmer, Decision};
 use coding_agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::settings::load_settings;
 use coding_agent::tools::build_tools;
@@ -70,32 +70,6 @@ impl Console for StdinConsole {
     }
 }
 
-/// 交互式确认方：审批闸门判 `ask` 时在终端问一句；`y` 批准、`n` 拒绝、`s` 挂起。
-struct StdinConfirmer {
-    input: Input,
-}
-
-#[async_trait::async_trait]
-impl Confirmer for StdinConfirmer {
-    async fn confirm(&self, request: &ApprovalRequest) -> Decision {
-        println!("\n[审批] 工具 `{}` 请求执行", request.tool);
-        println!("       说明：{}", request.description);
-        println!("       参数：{}", request.arguments);
-        loop {
-            print!("       选择 [y] 批准 / [n] 拒绝 / [s] 稍后决定（挂起）：");
-            let _ = std::io::stdout().flush();
-            match next_line(&self.input).await.as_deref().map(str::trim) {
-                Some("y" | "Y") => return Decision::Approve,
-                Some("n" | "N") => return Decision::Deny,
-                Some("s" | "S") => return Decision::Pending,
-                // EOF：无人可答 → 挂起（与「没有注入 confirmer」同一条路径）。
-                None => return Decision::Pending,
-                _ => println!("       请输入 y / n / s"),
-            }
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     init();
@@ -105,6 +79,31 @@ async fn main() -> anyhow::Result<()> {
         BufReader::new(tokio::io::stdin()).lines(),
     ));
 
+    // 交互式确认：y 批准 / n 拒绝 / s 挂起；EOF 与「没有注入 confirmer」同路径（挂起）。
+    let confirmer = Confirmer::new({
+        let input = input.clone();
+        move |request| {
+            let input = input.clone();
+            async move {
+                println!("\n[审批] 工具 `{}` 请求执行", request.tool);
+                println!("       说明：{}", request.description);
+                println!("       参数：{}", request.arguments);
+                loop {
+                    print!("       选择 [y] 批准 / [n] 拒绝 / [s] 稍后决定（挂起）：");
+                    let _ = std::io::stdout().flush();
+                    match next_line(&input).await.as_deref().map(str::trim) {
+                        Some("y" | "Y") => return Decision::Approve,
+                        Some("n" | "N") => return Decision::Deny,
+                        Some("s" | "S") => return Decision::Pending,
+                        // EOF：无人可答 → 挂起（与「没有注入 confirmer」同一条路径）。
+                        None => return Decision::Pending,
+                        _ => println!("       请输入 y / n / s"),
+                    }
+                }
+            }
+        }
+    });
+
     let agent = Agent::builder(
         Arc::new(LLMClient::new()),
         build_tools().await?,
@@ -112,9 +111,7 @@ async fn main() -> anyhow::Result<()> {
         DEFAULT_MAX_TURNS,
     )
     .approval_policy(settings.approval)
-    .confirmer(Arc::new(StdinConfirmer {
-        input: input.clone(),
-    }))
+    .confirmer(Arc::new(confirmer))
     .in_memory();
 
     println!("agent running... 输入 /help 查看命令，/quit 退出。");

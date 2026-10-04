@@ -19,34 +19,11 @@ use std::sync::Arc;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
 use coding_agent::llm::models::LLMClient;
-use coding_agent::react::approval::{ApprovalRequest, Confirmer, Decision};
+use coding_agent::react::approval::{Confirmer, Decision};
 use coding_agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::react::runner::ReactLoop;
 use coding_agent::settings::{ApprovalAction, SETTINGS_PATH, load_settings};
 use coding_agent::tools::build_tools;
-
-/// 交互式确认方：打印请求详情，读一行 stdin；`y` / `yes`（不分大小写）才批准。
-struct StdinConfirmer;
-
-#[async_trait::async_trait]
-impl Confirmer for StdinConfirmer {
-    async fn confirm(&self, request: &ApprovalRequest) -> Decision {
-        println!();
-        println!("[确认] 模型请求执行工具 `{}`", request.tool);
-        if !request.description.is_empty() {
-            println!("       说明：{}", request.description);
-        }
-        println!("       参数：{}", request.arguments);
-        print!("       允许执行？[y/N] ");
-        let _ = std::io::stdout().flush();
-
-        let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
-            Ok(_) if is_yes(line.trim()) => Decision::Approve,
-            _ => Decision::Deny,
-        }
-    }
-}
 
 fn is_yes(answer: &str) -> bool {
     answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
@@ -111,6 +88,24 @@ async fn main() -> anyhow::Result<()> {
     }
     println!();
 
+    // 交互式确认：打印请求详情，读一行 stdin；`y` / `yes`（不分大小写）才批准。
+    let confirmer = Confirmer::new(|request| async move {
+        println!();
+        println!("[确认] 模型请求执行工具 `{}`", request.tool);
+        if !request.description.is_empty() {
+            println!("       说明：{}", request.description);
+        }
+        println!("       参数：{}", request.arguments);
+        print!("       允许执行？[y/N] ");
+        let _ = std::io::stdout().flush();
+
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(_) if is_yes(line.trim()) => Decision::Approve,
+            _ => Decision::Deny,
+        }
+    });
+
     // 真实 LLM：需要 .env 中的 provider 与模型配置。
     let mut agent = ReactLoop::new(
         Arc::new(LLMClient::new()),
@@ -119,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
         DEFAULT_MAX_TURNS,
     )?
     .with_approval_policy(settings.approval)
-    .with_confirmer(Arc::new(StdinConfirmer));
+    .with_confirmer(Arc::new(confirmer));
 
     println!("User: {prompt}\n");
 
