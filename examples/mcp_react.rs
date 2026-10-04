@@ -18,7 +18,7 @@ use async_openai::types::chat::{
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
 use coding_agent::llm::models::{LLMClient, Reply};
-use coding_agent::react::approval::{Confirmer, Decision};
+use coding_agent::react::approval::{Decision, ScriptedConfirmer};
 use coding_agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::react::runner::ReactLoop;
 use coding_agent::settings::{ApprovalAction, ApprovalPolicy, ApprovalRule};
@@ -125,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
         }],
         ..Default::default()
     };
-    let confirmer = Confirmer::scripted(vec![Decision::Deny, Decision::Approve]);
+    let confirmer = ScriptedConfirmer::new(vec![Decision::Deny, Decision::Approve]);
 
     let mut agent = ReactLoop::new(Arc::new(llm), tools, SYSTEM_PROMPT, DEFAULT_MAX_TURNS)?
         .with_approval_policy(policy)

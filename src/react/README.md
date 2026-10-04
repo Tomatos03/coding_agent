@@ -12,7 +12,7 @@ ReAct（Reason + Act）主循环的垂直切片：思考 → 行动 → 观察�
 | `History` | `history.rs` | 消息序列的薄封装：`system` / `user` / `assistant` / `tool` + `as_slice` |
 | `Step` / `Termination` / `Outcome` | `models.rs` | 编排层词汇：轨迹事件、终止原因、运行结果；`DEFAULT_MAX_TURNS = 12` 也在这里 |
 | `ExecuteContext` / `Event` | `context.rs` | 执行上下文：唯一 ID、`Status` 流转、当前轮事件流（`set_turn` 只保留当前轮）；由 `observe()` 逐轮序列化进 tracing |
-| `Confirmer` / `ApprovalRequest` / `Decision` | `approval.rs` | 确认接缝：策略判 `ask` 时循环经它拿决定；三种来源——`new` 自定义应答器、`interactive` 终端仅 `y`/`n`（未选择则一直等待，EOF 挂起）、`scripted` 预置队列并记录请求快照 |
+| `Confirmer` / `ApprovalRequest` / `Decision` | `approval/` | 确认接缝：策略判 `ask` 时循环经它拿决定；`Confirmer` 是扩展点（trait，输入请求、输出决策、未决策前阻塞），内置 `TerminalConfirmer`（直接读终端 stdin，`y`/`n`，EOF 挂起）；`ScriptedConfirmer` 供测试离线、`FnConfirmer` 把闭包适配成确认方 |
 
 ![ReAct 模块组件与交互流程](assets/flow.svg)
 
@@ -67,4 +67,4 @@ ReAct（Reason + Act）主循环的垂直切片：思考 → 行动 → 观察�
 - 离线：`cargo test --lib` —— `runner.rs` 21 个覆盖循环逻辑：交付三态（参数即答案 / 与兄弟调用并存 / 消息全配对）、降级路径（纯文本 / 空回复 / 端点无视强制）、工具失败与未知工具压成 Observation、`final_answer` 参数非法重试、撞上限的强制收尾与工具面裁剪、软着陆三态、`Step` 发射顺序、审批闸门四态（拒绝压成 Observation 且不执行 / 批准照常执行 / 无 confirmer 时挂起 / allow 不咨询 confirmer）
 - `settings.rs` 11 个：配置解析（完整 / 空对象 / 默认值 / 非法 action / 空 pattern 拒绝 / 未知字段拒绝 / 缺文件回退）与匹配表（精确、前后缀通配、裸 `*`、首行锚定、规则顺序、`defaultAction` 回退）
 - `context.rs` 6 个：唯一 ID、状态流转、事件序列化（平铺 JSON、毫秒时间戳）、`set_turn` 只留当前轮、插入顺序
-- 接缝：`LLMClient::scripted` 的脚本化后端（预置响应队列，同时记录策略、工具面与消息）+ `EchoTool` + `Confirmer::scripted`（预置决策队列，`scripted_requests()` 取回请求快照）替掉真实网络与人工输入，全部离线
+- 接缝：`LLMClient::scripted` 的脚本化后端（预置响应队列，同时记录策略、工具面与消息）+ `EchoTool` + `ScriptedConfirmer`（预置决策队列，`requests()` 取回请求快照）替掉真实网络与人工输入，全部离线

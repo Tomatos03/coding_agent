@@ -34,7 +34,7 @@ src/
 | `react/runner.rs` | `ReactLoop` | 循环推进、工具派发、终止判定、撞上限的软收尾、危险工具的审批闸门 |
 | `react/history.rs` | `History` | 消息序列（`system` / `user` / `assistant` / `tool`）；只增不减 |
 | `react/models.rs` | `Step` · `Termination` · `Outcome` | 编排层词汇；`DEFAULT_MAX_TURNS` 也在这里 |
-| `react/approval.rs` | `Confirmer` · `Decision` | 工具执行前的确认接缝（`Approve` / `Deny` / `Pending`） |
+| `react/approval/` | `Confirmer` · `Decision` | 工具执行前的确认接缝：`Confirmer` 是扩展点（trait），内置 `TerminalConfirmer`；`Approve` / `Deny` / `Pending` |
 | `react/context.rs` | `ExecuteContext` · `Event` | 运行上下文：唯一 ID、`Status` 流转、逐轮事件流；`observe()` 序列化进 tracing |
 | `session/manager.rs` | `SessionManager` · `InMemorySessionManager` · `SessionRuntimeConfig` | 会话注册表：为每个会话持有常驻 `ReactLoop`，维护挂起标记与恢复游标 |
 | `session/models.rs` | `Session` · `SessionSummary` | 会话数据与摘要；标题 / 消息数 / 挂起态都从历史**派生** |

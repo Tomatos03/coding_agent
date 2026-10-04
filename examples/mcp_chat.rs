@@ -18,7 +18,7 @@ use std::sync::Arc;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
 use coding_agent::llm::models::LLMClient;
-use coding_agent::react::approval::Confirmer;
+use coding_agent::react::approval::TerminalConfirmer;
 use coding_agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::react::runner::ReactLoop;
 use coding_agent::settings::{ApprovalAction, SETTINGS_PATH, load_settings};
@@ -84,13 +84,7 @@ async fn main() -> anyhow::Result<()> {
     println!();
 
     // 交互式确认：仅 y 批准 / n 拒绝；未做出选择则一直等待，EOF 挂起。
-    let confirmer = Confirmer::interactive(|| async {
-        let mut line = String::new();
-        match std::io::stdin().read_line(&mut line) {
-            Ok(0) | Err(_) => None,
-            Ok(_) => Some(line),
-        }
-    });
+    let confirmer = TerminalConfirmer::new();
 
     // 真实 LLM：需要 .env 中的 provider 与模型配置。
     let mut agent = ReactLoop::new(

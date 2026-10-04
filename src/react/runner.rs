@@ -20,7 +20,7 @@ pub struct ReactLoop {
     history: History,
     max_turns: usize,
     approval_policy: ApprovalPolicy,
-    confirmer: Option<Arc<Confirmer>>,
+    confirmer: Option<Arc<dyn Confirmer>>,
 }
 
 impl ReactLoop {
@@ -68,7 +68,7 @@ impl ReactLoop {
 
     /// 注入确认方。策略判 `ask` 而没有 confirmer 时，该调用会被**挂起**
     /// （`Termination::Suspended`），而不是旧版的直接拒绝。
-    pub fn with_confirmer(mut self, confirmer: Arc<Confirmer>) -> Self {
+    pub fn with_confirmer(mut self, confirmer: Arc<dyn Confirmer>) -> Self {
         self.confirmer = Some(confirmer);
         self
     }
@@ -679,7 +679,7 @@ mod tests {
 
     use crate::llm::callback::{Callback, CallbackEvent};
     use crate::llm::models::{Reply, ToolPolicy};
-    use crate::react::approval::{Confirmer, Decision};
+    use crate::react::approval::{Confirmer, Decision, ScriptedConfirmer};
     use crate::react::models::DEFAULT_MAX_TURNS;
     use crate::settings::{ApprovalAction, ApprovalPolicy, ApprovalRule};
     use crate::tools::local::final_answer::{FINAL_ANSWER_TOOL, FinalAnswer};
@@ -871,7 +871,7 @@ mod tests {
     fn build_with_gate(
         llm: Arc<LLMClient>,
         policy: ApprovalPolicy,
-        confirmer: Option<Arc<Confirmer>>,
+        confirmer: Option<Arc<dyn Confirmer>>,
     ) -> (ReactLoop, Arc<EchoProbe>) {
         let (agent, executed) = build_with_probe(llm, DEFAULT_MAX_TURNS);
         let mut agent = agent.with_approval_policy(policy);
@@ -1356,7 +1356,7 @@ mod tests {
             calls_echo(r#"{"q":"hi"}"#),
             calls_final_answer("被拒之后改口"),
         ]);
-        let confirmer = Arc::new(Confirmer::scripted(vec![Decision::Deny]));
+        let confirmer = Arc::new(ScriptedConfirmer::new(vec![Decision::Deny]));
         let (mut agent, executed) = build_with_gate(llm, ask_for("echo"), Some(confirmer.clone()));
 
         let observed = Mutex::new(Vec::new());
@@ -1372,7 +1372,7 @@ mod tests {
         assert_eq!(outcome.termination, Termination::FinalAnswer);
         assert_eq!(outcome.answer, "被拒之后改口");
         assert_eq!(executed.count(), 0, "被拒的调用不得执行");
-        assert_eq!(confirmer.scripted_requests().len(), 1);
+        assert_eq!(confirmer.requests().len(), 1);
         assert_eq!(
             tool_messages(&agent),
             2,
@@ -1395,7 +1395,7 @@ mod tests {
             .expect("被拒的调用应产生一条 Observation");
         assert!(denied.contains("拒绝"), "观察文案应讲明被拒：{denied}");
 
-        let requests = confirmer.scripted_requests();
+        let requests = confirmer.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].turn, 1);
         assert_eq!(requests[0].tool, "echo");
@@ -1414,7 +1414,7 @@ mod tests {
         let (mut agent, executed) = build_with_gate(
             llm,
             ask_for("echo"),
-            Some(Arc::new(Confirmer::scripted(vec![Decision::Approve]))),
+            Some(Arc::new(ScriptedConfirmer::new(vec![Decision::Approve]))),
         );
 
         let outcome = agent
@@ -1541,7 +1541,7 @@ mod tests {
             calls_final_answer("答案"),
         ]);
         // 策略全放行；confirmer 预置了拒绝决策——若被咨询，执行次数会变成 0。
-        let confirmer = Arc::new(Confirmer::scripted(vec![Decision::Deny]));
+        let confirmer = Arc::new(ScriptedConfirmer::new(vec![Decision::Deny]));
         let (mut agent, executed) =
             build_with_gate(llm, ApprovalPolicy::default(), Some(confirmer.clone()));
 
@@ -1552,10 +1552,7 @@ mod tests {
 
         assert_eq!(outcome.termination, Termination::FinalAnswer);
         assert_eq!(executed.count(), 1, "放行的调用照常执行");
-        assert!(
-            confirmer.scripted_requests().is_empty(),
-            "allow 不必咨询 confirmer"
-        );
+        assert!(confirmer.requests().is_empty(), "allow 不必咨询 confirmer");
     }
 
     #[tokio::test]

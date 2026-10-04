@@ -31,7 +31,7 @@ pub struct SessionRuntimeConfig {
     pub system_prompt: String,
     pub max_turns: usize,
     pub approval_policy: ApprovalPolicy,
-    pub confirmer: Option<Arc<Confirmer>>,
+    pub confirmer: Option<Arc<dyn Confirmer>>,
 }
 
 /// 会话数据 + 它的活体 loop。

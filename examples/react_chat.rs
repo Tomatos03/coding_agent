@@ -27,22 +27,16 @@ use coding_agent::Console;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
 use coding_agent::llm::models::LLMClient;
-use coding_agent::react::approval::Confirmer;
+use coding_agent::react::approval::TerminalConfirmer;
 use coding_agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::settings::load_settings;
 use coding_agent::tools::build_tools;
 use tokio::io::{AsyncBufReadExt, BufReader, Lines, Stdin};
 
-/// 共享的 stdin 行读取器：REPL 的 `Console` 与确认方都用它，靠 `Mutex` 串行化。
-type Input = Arc<tokio::sync::Mutex<Lines<BufReader<Stdin>>>>;
-
-async fn next_line(input: &Input) -> Option<String> {
-    input.lock().await.next_line().await.ok().flatten()
-}
-
 /// 把 stdin/stdout 接到 [`Console`]：库里决定「什么时候读」，这里只决定「怎么读、怎么显示」。
+/// 确认方（`TerminalConfirmer`）直接读 stdin，不经过这里。
 struct StdinConsole {
-    input: Input,
+    input: Lines<BufReader<Stdin>>,
     /// 命令行上的位置参数：作为首条提问先喂给循环，之后再读 stdin。
     pending: VecDeque<String>,
 }
@@ -56,7 +50,7 @@ impl Console for StdinConsole {
         }
         print!("\n> ");
         let _ = std::io::stdout().flush();
-        next_line(&self.input).await
+        self.input.next_line().await.ok().flatten()
     }
 
     fn print(&mut self, line: &str) {
@@ -95,18 +89,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let settings = load_settings()?;
-    let input: Input = Arc::new(tokio::sync::Mutex::new(
-        BufReader::new(tokio::io::stdin()).lines(),
-    ));
 
     // 交互式确认：仅 y 批准 / n 拒绝；未做出选择则一直等待，EOF 挂起。
-    let confirmer = Confirmer::interactive({
-        let input = input.clone();
-        move || {
-            let input = input.clone();
-            async move { next_line(&input).await }
-        }
-    });
+    let confirmer = TerminalConfirmer::new();
 
     let mut builder = Agent::builder(
         Arc::new(LLMClient::new()),
@@ -127,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut console = StdinConsole {
-        input,
+        input: BufReader::new(tokio::io::stdin()).lines(),
         pending: initial.into(),
     };
     agent.run(&mut console).await?;
