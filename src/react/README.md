@@ -12,7 +12,7 @@ ReAct（Reason + Act）主循环的垂直切片：思考 → 行动 → 观察�
 | `History` | `history.rs` | 消息序列的薄封装：`system` / `user` / `assistant` / `tool` + `as_slice` |
 | `Step` / `Termination` / `Outcome` | `models.rs` | 编排层词汇：轨迹事件、终止原因、运行结果；`DEFAULT_MAX_TURNS = 12` 也在这里 |
 | `ExecuteContext` / `Event` | `context.rs` | 执行上下文：唯一 ID、`Status` 流转、当前轮事件流（`set_turn` 只保留当前轮）；由 `observe()` 逐轮序列化进 tracing |
-| `Confirmer` / `ApprovalRequest` / `Decision` | `approval.rs` | 确认接缝：策略判 `ask` 时循环经它拿决定；问谁、怎么问由构造时注入的应答器决定，脚本化模式记录请求快照 |
+| `Confirmer` / `ApprovalRequest` / `Decision` | `approval.rs` | 确认接缝：策略判 `ask` 时循环经它拿决定；三种来源——`new` 自定义应答器、`interactive` 终端仅 `y`/`n`（未选择则一直等待，EOF 挂起）、`scripted` 预置队列并记录请求快照 |
 
 ![ReAct 模块组件与交互流程](assets/flow.svg)
 
@@ -50,7 +50,7 @@ ReAct（Reason + Act）主循环的垂直切片：思考 → 行动 → 观察�
 - **撞轮次上限走软收尾，不 `bail!`**。直接报错会把整轮探索的成果扔掉；收尾的三种失败情形一律软着陆。
 - **`final_answer` 是普通可执行工具**，不是 `execute` 之前的特殊分支：它的 `execute` 输入即输出，循环用统一的 action → Observation 路径拿到答案，配对消息天然成立；`extract_answer` / `execute` 都是纯函数，可安全重复调用。
 - **循环内每轮 `tool_choice = required`**，`content` 永远只是 thought；端点以 400 拒绝时真实后端置粘性标记、降级为 `Auto` 重发（见 `llm` 模块）。
-- **审批闸门在 dispatch 之前**：`action()` 发完 `Step::Action` 后查策略，判 `ask` 时经 `Confirmer` 拿决定；拒绝走与「工具失败 / 未知工具」完全相同的通道（压成 Observation），循环继续、配对消息照常——不变量①②不受影响。策略判 `ask` 但未注入 `confirmer` 时**挂起**（`Termination::Suspended`，与主动返回 `Decision::Pending` 同一条路径）。闸门只按暴露名判 glob，参数级粒度由 `Confirmer` 自己拿 `arguments` 判断；`final_answer` 的交付路径与收尾轮不执行工具，天然豁免。
+- **审批闸门在 dispatch 之前**：`action()` 发完 `Step::Action` 后查策略，判 `ask` 时经 `Confirmer` 拿决定；拒绝走与「工具失败 / 未知工具」完全相同的通道（压成 Observation），循环继续、配对消息照常——不变量①②不受影响。策略判 `ask` 但未注入 `confirmer` 时**挂起**（`Termination::Suspended`；自定义确认器主动返回 `Decision::Pending` 走同一条路，`interactive` 仅在 EOF 时如此）。闸门只按暴露名判 glob，参数级粒度由 `Confirmer` 自己拿 `arguments` 判断；`final_answer` 的交付路径与收尾轮不执行工具，天然豁免。
 - **`Step::Thought` 与 `Step::Answer` 互斥**，判据 `calls.is_empty()` 必须先于发射——顺序写反会把最终答案错标成 Thinking。这条由按轮次断言事件序列的测试钉住。
 - **流式与「区分思考 / 答案」不可兼得**，这是物理限制：token 到达时，这一轮会不会有 `tool_calls` 还不知道。要逐字输出用 `on_token`（内容统一渲染），要分得清用 `on_step`（整段到达）；`react_chat` 只消费 `on_step`。
 

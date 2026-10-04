@@ -27,7 +27,7 @@ use coding_agent::Console;
 use coding_agent::bootstrap::init;
 use coding_agent::constant::prompt::SYSTEM_PROMPT;
 use coding_agent::llm::models::LLMClient;
-use coding_agent::react::approval::{Confirmer, Decision};
+use coding_agent::react::approval::Confirmer;
 use coding_agent::react::models::{DEFAULT_MAX_TURNS, Step};
 use coding_agent::settings::load_settings;
 use coding_agent::tools::build_tools;
@@ -99,28 +99,12 @@ async fn main() -> anyhow::Result<()> {
         BufReader::new(tokio::io::stdin()).lines(),
     ));
 
-    // 交互式确认：y 批准 / n 拒绝 / s 挂起；EOF 与「没有注入 confirmer」同路径（挂起）。
-    let confirmer = Confirmer::new({
+    // 交互式确认：仅 y 批准 / n 拒绝；未做出选择则一直等待，EOF 挂起。
+    let confirmer = Confirmer::interactive({
         let input = input.clone();
-        move |request| {
+        move || {
             let input = input.clone();
-            async move {
-                println!("\n[审批] 工具 `{}` 请求执行", request.tool);
-                println!("       说明：{}", request.description);
-                println!("       参数：{}", request.arguments);
-                loop {
-                    print!("       选择 [y] 批准 / [n] 拒绝 / [s] 稍后决定（挂起）：");
-                    let _ = std::io::stdout().flush();
-                    match next_line(&input).await.as_deref().map(str::trim) {
-                        Some("y" | "Y") => return Decision::Approve,
-                        Some("n" | "N") => return Decision::Deny,
-                        Some("s" | "S") => return Decision::Pending,
-                        // EOF：无人可答 → 挂起（与「没有注入 confirmer」同一条路径）。
-                        None => return Decision::Pending,
-                        _ => println!("       请输入 y / n / s"),
-                    }
-                }
-            }
+            async move { next_line(&input).await }
         }
     });
 

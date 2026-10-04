@@ -22,7 +22,7 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 
 ## 测试
 
-**当前 263 个测试**：默认跑 259 个（全部离线，不联网、不需要凭证），另外 4 个是 `#[ignore]`：3 个 MCP 集成测试（需要本机 `python3`）+ 1 个 embedding 真实端点联测（需要 `EMBEDDING_*` 凭证）。下列按文件列举重点覆盖，非全部测试。
+**当前 268 个测试**：默认跑 264 个（全部离线，不联网、不需要凭证），另外 4 个是 `#[ignore]`：3 个 MCP 集成测试（需要本机 `python3`）+ 1 个 embedding 真实端点联测（需要 `EMBEDDING_*` 凭证）。下列按文件列举重点覆盖，非全部测试。
 
 `src/react/runner.rs` 20 个，覆盖循环逻辑：
 
@@ -46,6 +46,8 @@ cargo clippy                       # 当前 -- -D warnings 下零告警
 - **恢复**：`resume(决定, turn)` 从半途批次继续，**已完成的调用不重跑**（按 tool 消息序列断言），且不重发已发出的 `Step::Action`；非挂起态调 `resume` 报错
 
 后两条用 `trace()` 辅助函数把 `Step` 压成 `(轮次, 类型)` 序列做整体比对——比逐个 `assert!(matches!(...))` 更能钉住**顺序**，而这两条的核心正是发射顺序。
+
+`src/react/approval.rs` 3 个：`interactive` 的 y/n 映射（含大小写与首尾空白容忍）、非法/空输入后继续等待不决定、EOF 挂起。
 
 `src/react/context.rs` 6 个：`ExecuteContext` 每次构造拿到唯一 id 且初始 `Running`、`set_status` 的状态流转、`Event` 记录 name/content/role/timestamp、事件序列化为平铺 JSON（毫秒时间戳）、`set_turn` 只保留当前轮事件、事件保持插入顺序。
 

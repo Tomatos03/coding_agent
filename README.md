@@ -160,7 +160,7 @@ ReAct 循环执行任何工具前会查一次审批策略：判 `ask` 的调用�
 | 情况 | 行为 |
 |---|---|
 | `.agents/settings.json` 不存在 | 全放行，不报错 |
-| 策略判 `ask`、调用方注入了确认器 | 先征求同意再执行；被拒绝 → Observation，循环继续 |
+| 策略判 `ask`、调用方注入了确认器 | 先征求同意再执行（终端交互仅 `y` / `n`，未做出选择则一直等待）；被拒绝 → Observation，循环继续 |
 | 策略判 `ask`、但没有注入确认器 | **挂起**（`Termination::Suspended`）：不执行、也不写 Observation，等显式 `resume` |
 | `final_answer` 与撞上限的收尾轮 | 不执行工具，天然豁免闸门 |
 
